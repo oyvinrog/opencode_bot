@@ -1,14 +1,21 @@
-# Matrix ELIZA bot
+# Matrix–OpenCode bot
 
-A Python ELIZA-style chat bot using `matrix-nio`. It reads and replies in
-end-to-end encrypted Matrix rooms and sends an end-to-end encrypted image when
-someone types `!send_pic`.
+An end-to-end encrypted Matrix bot that controls an OpenCode coding session. Each
+authorized Matrix room maps to one OpenCode session, ordinary messages become
+prompts, and responses are streamed back by editing a Matrix message.
 
-## Set up
+The bot connects to an existing `opencode serve` process through its HTTP API. It
+does not start or supervise OpenCode.
 
-Requirements: Python 3.11+, a Matrix account for the bot, and a Matrix room with
-encryption enabled. On some Linux distributions the `matrix-nio[e2e]` install
-also needs the system packages `libolm-dev`, `python3-dev`, and a C compiler.
+## Requirements and setup
+
+- Python 3.11+
+- OpenCode with a working provider/model configuration
+- A dedicated Matrix account and an encrypted Matrix room
+- On some Linux systems, `matrix-nio[e2e]` also needs `libolm-dev`, Python headers,
+  and a C compiler
+
+Create the environment and install the project:
 
 ```bash
 python3 -m venv .venv
@@ -17,50 +24,105 @@ pip install -e '.[test]'
 cp .env.example .env
 ```
 
-Edit `.env`, then export it and start the bot:
+Start OpenCode on loopback with Basic Auth. Use the same password in `.env`:
+
+```bash
+OPENCODE_SERVER_PASSWORD='a-strong-separate-password' \
+  opencode serve --hostname 127.0.0.1 --port 4096
+```
+
+Configure `.env`, then run the bot:
 
 ```bash
 set -a
 . ./.env
 set +a
-matrix-eliza
+matrix-opencode
 ```
 
-On the first run it logs in with `MATRIX_PASSWORD`, creates a Matrix device, and
-saves its access token plus encryption keys under `ELIZA_DATA_DIR`. Remove the
-password from `.env` after that first successful login. Keep the entire data
-directory private and persistent; losing it changes the device identity and
-loses old room keys.
+The first run logs in with `MATRIX_PASSWORD`, creates a Matrix device, and stores
+the access token and encryption keys under `MATRIX_DATA_DIR`. Remove the Matrix
+password from `.env` after the first successful login. Keep the entire data
+directory private and persistent. Existing `data/session.json` and
+`data/crypto_store` files from the ELIZA example are reused unchanged.
 
-In Element (or another full Matrix client), verify the newly created **ELIZA
-bot** device. Invite the bot to an already encrypted room, or list that room in
-`MATRIX_ALLOWED_ROOMS` and enable `MATRIX_AUTO_JOIN=true`. Matrix room encryption
-cannot be disabled once enabled, but this bot still checks it before responding.
+Verify the new **Matrix OpenCode bot** device in Element or another full Matrix
+client. The bot refuses to send to unverified recipient devices by default.
+`MATRIX_IGNORE_UNVERIFIED_DEVICES=true` permits unattended use but weakens device
+identity assurance; message contents remain encrypted.
 
-The default `MATRIX_IGNORE_UNVERIFIED_DEVICES=false` is the safer policy: the bot
-will refuse to send when another room member has an unverified device. Verify
-those devices from the bot account. For a fully unattended bot you can set the
-option to `true`; messages remain encrypted, but the bot no longer authenticates
-recipient device identities, so an unexpected device could receive them.
+## Access policy
 
-Set `ELIZA_PICTURE` to a PNG, JPEG, GIF, or other Pillow-supported image. If it
-is omitted, the bot generates a small ELIZA illustration. The uploaded image
-bytes are encrypted before upload and the room event contains the decryption
-key, so the homeserver does not receive the plaintext image.
+`MATRIX_ALLOWED_ROOMS` and `MATRIX_ALLOWED_SENDERS` are mandatory comma-separated
+allowlists. An accepted command must satisfy both. Everyone on the sender list in
+a room shares control of that room's OpenCode session, including permission
+decisions and aborts.
+
+`OPENCODE_DEFAULT_DIRECTORY` must be an existing directory beneath one of the
+existing directories in `OPENCODE_ALLOWED_ROOTS`. Separate roots using the
+platform path separator (`:` on Linux/macOS). `!new relative/path` resolves from
+the default directory; absolute paths are also accepted when their fully resolved
+target remains beneath an allowed root. This rejects `..` traversal and symlink
+escapes.
+
+Protect the OpenCode server with `OPENCODE_SERVER_PASSWORD`, bind it to loopback,
+and do not expose port 4096 publicly. The username defaults to `opencode`.
 
 ## Commands
 
-- `!send_pic` — upload and send the configured picture with encrypted attachment metadata
-- `!help` — show a short help message
-- Anything else — receive an ELIZA-style response
+- `!help` — show the command list
+- `!new [directory]` — create a new session, using the default directory when omitted
+- Ordinary messages — prompt the current session
+- `!status` — show the session, directory, activity, permissions, and change totals
+- `!allow` — allow the oldest pending permission once
+- `!deny` — reject the oldest pending permission
+- `!diff` — show unified diffs for the session
+- `!stop` — abort the current operation
+- `!reset` — discard only the room mapping
 
-Run the local tests with `pytest`. They do not contact a Matrix server.
+One prompt at a time is accepted per room. `!reset` neither deletes the OpenCode
+session nor reverts files, and it is refused while the session is busy. New
+sessions also leave earlier OpenCode sessions and their changes intact.
+
+Assistant text is relayed through Matrix `m.replace` edits at most once per
+second. Reasoning and tool internals are not posted. Permission requests and
+errors are sent immediately. Replies longer than 20,000 characters are split at
+completion.
+
+## Persistence and recovery
+
+Room mappings and in-flight Matrix event IDs are stored atomically in
+`data/room_sessions.json` with owner-only permissions. On restart, the bot checks
+that directories are still allowed and that sessions still exist. If a response
+completed while disconnected, it reads recent OpenCode messages and finishes the
+pending Matrix edit.
+
+## Testing and smoke check
+
+The test suite does not contact Matrix or OpenCode:
+
+```bash
+pytest
+```
+
+Before starting the bot, check the configured server manually:
+
+```bash
+curl -u "${OPENCODE_SERVER_USERNAME:-opencode}:${OPENCODE_SERVER_PASSWORD}" \
+  "${OPENCODE_URL:-http://127.0.0.1:4096}/global/health"
+```
+
+Then invite the bot to an allowed encrypted room, verify its device, run `!new`,
+send a small read-only prompt, and confirm `!status`, `!diff`, and permission
+handling.
 
 ## Security notes
 
-- Prefer a dedicated Matrix account and an explicit `MATRIX_ALLOWED_ROOMS` list.
-- Do not commit `.env`, `data/session.json`, or `data/crypto_store`.
-- Use HTTPS for `MATRIX_HOMESERVER`; transport TLS and Matrix E2EE protect
-  different parts of the connection.
-- This implements encrypted messaging and encrypted attachments. It does not
-  implement interactive emoji verification or cross-signing/key backup.
+- Use dedicated Matrix and OpenCode credentials and keep `.env` and `data/` out
+  of version control.
+- An allowed sender can ask OpenCode to read, edit, or execute within its own
+  configured permissions. Keep OpenCode's permission policy restrictive.
+- Matrix E2EE protects room events. HTTPS or loopback transport separately
+  protects the connection to OpenCode.
+- Interactive emoji verification, cross-signing, and key backup are not
+  implemented by this bot.

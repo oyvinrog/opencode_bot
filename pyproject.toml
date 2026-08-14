@@ -3,26 +3,25 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "matrix-eliza-bot"
-version = "0.1.0"
-description = "An end-to-end encrypted ELIZA bot for Matrix"
+name = "matrix-opencode-bot"
+version = "0.2.0"
+description = "An end-to-end encrypted Matrix bridge for OpenCode"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "aiohttp>=3.10,<4",
     "matrix-nio[e2e]>=0.26,<0.27",
-    "Pillow>=10,<12",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1"]
 
 [project.scripts]
-matrix-eliza = "matrix_eliza_bot.bot:main"
+matrix-opencode = "matrix_opencode_bot.bot:main"
 
 [tool.setuptools.packages.find]
-include = ["matrix_eliza_bot*"]
+include = ["matrix_opencode_bot*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
