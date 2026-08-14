@@ -72,7 +72,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 
 - `!help` — show the command list
 - `!new [directory]` — create a new session, using the default directory when omitted
-- Ordinary messages — prompt the current session
+- Ordinary messages — prompt the current session, creating one in the default directory if needed
 - `!status` — show the session, directory, activity, permissions, and change totals
 - `!allow` — allow the oldest pending permission once
 - `!deny` — reject the oldest pending permission
@@ -80,9 +80,12 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!stop` — abort the current operation
 - `!reset` — discard only the room mapping
 
-One prompt at a time is accepted per room. `!reset` neither deletes the OpenCode
-session nor reverts files, and it is refused while the session is busy. New
-sessions also leave earlier OpenCode sessions and their changes intact.
+The first ordinary message in an unmapped room automatically creates a session in
+`OPENCODE_DEFAULT_DIRECTORY`. Use `!new [directory]` when you want to choose a
+different workspace. One prompt at a time is accepted per room. `!reset` neither
+deletes the OpenCode session nor reverts files, and it is refused while the
+session is busy. New sessions also leave earlier OpenCode sessions and their
+changes intact.
 
 Assistant text is relayed through Matrix `m.replace` edits at most once per
 second. Reasoning and tool internals are not posted. Permission requests and
@@ -112,9 +115,8 @@ curl -u "${OPENCODE_SERVER_USERNAME:-opencode}:${OPENCODE_SERVER_PASSWORD}" \
   "${OPENCODE_URL:-http://127.0.0.1:4096}/global/health"
 ```
 
-Then invite the bot to an allowed encrypted room, verify its device, run `!new`,
-send a small read-only prompt, and confirm `!status`, `!diff`, and permission
-handling.
+Then invite the bot to an allowed encrypted room, verify its device, send a small
+read-only prompt, and confirm `!status`, `!diff`, and permission handling.
 
 ## Security notes
 

@@ -36,7 +36,7 @@ EDIT_INTERVAL_SECONDS = 1.0
 
 HELP = """Matrix–OpenCode commands:
 !new [directory] — start a session
-Ordinary messages — prompt the current session
+Ordinary messages — prompt the current session, creating one if needed
 !status — show current activity
 !allow / !deny — answer the oldest permission request
 !diff — show changed files
@@ -135,27 +135,38 @@ class MatrixOpenCodeBot:
             await self.send_text(room_id, "The current session is busy. Use !stop before !new.")
             return
         try:
-            directory = self.settings.resolve_directory(requested)
+            state = await self._create_room_session(room_id, requested)
         except ValueError as exc:
             await self.send_text(room_id, f"Cannot start session: {exc}")
             return
-        session = await self.opencode.create_session(str(directory), title="Matrix OpenCode session")
+        await self.send_text(
+            room_id,
+            f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}",
+        )
+
+    async def _create_room_session(
+        self, room_id: str, requested: str | None = None
+    ) -> RoomSession:
+        directory = self.settings.resolve_directory(requested)
+        session = await self.opencode.create_session(
+            str(directory), title="Matrix OpenCode session"
+        )
         state = RoomSession(
             session_id=str(session["id"]),
             directory=str(directory),
             title=str(session.get("title") or "Matrix OpenCode session"),
         )
         await self.store.set(room_id, state)
-        await self.send_text(
-            room_id,
-            f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}",
-        )
+        return state
 
     async def prompt(self, room_id: str, text: str) -> None:
         state = self.store.rooms.get(room_id)
         if not state:
-            await self.send_text(room_id, "No session is mapped to this room. Use !new [directory].")
-            return
+            try:
+                state = await self._create_room_session(room_id)
+            except ValueError as exc:
+                await self.send_text(room_id, f"Cannot automatically start session: {exc}")
+                return
         status = await self._status(state)
         if state.in_flight_event_id or status.get("type") != "idle":
             await self.send_text(room_id, "This session is busy. Wait for it to finish or use !stop.")

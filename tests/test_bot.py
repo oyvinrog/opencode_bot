@@ -95,6 +95,21 @@ async def test_prompt_creates_placeholder_and_calls_async_api(tmp_path: Path) ->
     assert store.rooms["!one:example"].in_flight_event_id == "$event1"
 
 
+async def test_prompt_automatically_creates_missing_session(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+
+    await bot.on_message(room(), message(bot, "Hello OpenCode"))
+
+    opencode.create_session.assert_awaited_once_with(
+        str(tmp_path.resolve()), title="Matrix OpenCode session"
+    )
+    opencode.prompt_async.assert_awaited_once_with(
+        "ses_1", str(tmp_path.resolve()), "Hello OpenCode"
+    )
+    assert store.rooms["!one:example"].session_id == "ses_1"
+    assert matrix.room_send.await_args_list[0].kwargs["content"]["body"] == "Working…"
+
+
 async def test_busy_prompt_is_rejected(tmp_path: Path) -> None:
     bot, matrix, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession(
