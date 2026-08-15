@@ -4,8 +4,8 @@ An end-to-end encrypted Matrix bot that controls an OpenCode coding session. Eac
 authorized Matrix room maps to one OpenCode session, ordinary messages become
 prompts, and responses are streamed back by editing a Matrix message.
 
-The bot connects to an existing `opencode serve` process through its HTTP API. It
-does not start or supervise OpenCode.
+The bot connects to an `opencode serve` process through its HTTP API. The included
+`run.sh` launcher starts and supervises both processes for local use.
 
 ## Requirements and setup
 
@@ -24,14 +24,29 @@ pip install -e .
 cp .env.example .env
 ```
 
-Start OpenCode on loopback with Basic Auth. Use the same password in `.env`:
+After configuring `.env`, start both OpenCode and the bot with:
+
+```bash
+./run.sh
+```
+
+The launcher loads `.env`, starts OpenCode when needed, waits for it to become
+healthy, then starts the bot. If a healthy server is already listening at
+`OPENCODE_URL`, the launcher reuses it and leaves it running when the bot stops.
+Otherwise, Ctrl-C stops both processes. By default OpenCode serves on
+`127.0.0.1:4096`; optional `OPENCODE_SERVER_HOSTNAME` and
+`OPENCODE_SERVER_PORT` values in `.env` can change that, and `OPENCODE_URL` must
+point to the same address.
+
+To run the processes separately instead, start OpenCode on loopback with Basic
+Auth (using the same password as `.env`):
 
 ```bash
 OPENCODE_SERVER_PASSWORD='a-strong-separate-password' \
   opencode serve --hostname 127.0.0.1 --port 4096
 ```
 
-Configure `.env`, then run the bot:
+Then load the configuration and run the bot in another terminal:
 
 ```bash
 set -a
