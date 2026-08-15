@@ -20,7 +20,7 @@ Create the environment and install the project:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e '.[test]'
+pip install -e .
 cp .env.example .env
 ```
 
@@ -107,6 +107,7 @@ pending Matrix edit.
 The test suite does not contact Matrix or OpenCode:
 
 ```bash
+pip install -e '.[test]'
 pytest
 ```
 
