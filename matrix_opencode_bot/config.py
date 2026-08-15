@@ -40,6 +40,7 @@ class Settings:
     opencode_password: str | None
     default_directory: Path
     allowed_roots: tuple[Path, ...]
+    show_reasoning: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -89,6 +90,7 @@ class Settings:
             opencode_password=os.environ.get("OPENCODE_SERVER_PASSWORD"),
             default_directory=default_directory,
             allowed_roots=roots,
+            show_reasoning=env_bool("MATRIX_SHOW_REASONING", False),
         )
 
     def resolve_directory(self, requested: str | None) -> Path:

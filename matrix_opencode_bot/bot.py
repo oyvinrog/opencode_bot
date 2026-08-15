@@ -32,6 +32,7 @@ from .state import PendingPermission, RoomSession, StateStore
 
 LOG = logging.getLogger("matrix_opencode")
 MAX_MESSAGE_CHARS = 20_000
+MAX_REASONING_CHARS = 8_000
 EDIT_INTERVAL_SECONDS = 1.0
 
 HELP = """Matrix–OpenCode commands:
@@ -179,7 +180,10 @@ class MatrixOpenCodeBot:
         state.in_flight_event_id = event_id
         state.prompt_started_ms = int(time.time() * 1000)
         state.text_parts.clear()
+        state.reasoning_parts.clear()
         state.activity = "starting"
+        state.activity_history.clear()
+        state.plan_items.clear()
         state.stop_requested = False
         await self.store.save()
         try:
@@ -357,8 +361,11 @@ class MatrixOpenCodeBot:
                 state.text_parts[str(part.get("id", len(state.text_parts)))] = str(part.get("text", ""))
                 self.schedule_live_edit(room_id, state)
             elif part_type == "reasoning":
-                # Deliberately report the phase without relaying private chain-of-thought.
-                state.activity = "Reasoning"
+                if self.settings.show_reasoning:
+                    state.reasoning_parts[str(part.get("id", len(state.reasoning_parts)))] = (
+                        str(part.get("text", ""))
+                    )
+                self._set_activity(state, "Reasoning")
                 self.schedule_live_edit(room_id, state)
             elif part_type == "tool":
                 tool_state = part.get("state", {})
@@ -371,22 +378,22 @@ class MatrixOpenCodeBot:
                         "completed": "Completed tool",
                         "error": "Tool failed",
                     }.get(status, "Tool")
-                    state.activity = f"{verb}: {tool}"
+                    self._set_activity(state, f"{verb}: {tool}")
                     self.schedule_live_edit(room_id, state)
             elif part_type == "patch":
                 files = part.get("files", [])
                 count = len(files) if isinstance(files, list) else 0
-                state.activity = f"Updated {count} file{'s' if count != 1 else ''}"
+                self._set_activity(state, f"Updated {count} file{'s' if count != 1 else ''}")
                 self.schedule_live_edit(room_id, state)
             elif part_type in {"agent", "subtask"}:
                 agent = _safe_activity_label(part.get("name") or part.get("agent") or "agent")
-                state.activity = f"Running agent: {agent}"
+                self._set_activity(state, f"Running agent: {agent}")
                 self.schedule_live_edit(room_id, state)
             elif part_type == "step-start":
-                state.activity = "Starting next step"
+                self._set_activity(state, "Starting next step")
                 self.schedule_live_edit(room_id, state)
             elif part_type == "step-finish":
-                state.activity = "Step completed"
+                self._set_activity(state, "Step completed")
                 self.schedule_live_edit(room_id, state)
             return
 
@@ -394,9 +401,12 @@ class MatrixOpenCodeBot:
             status = properties.get("status", {})
             if isinstance(status, dict):
                 if status.get("type") == "retry":
-                    state.activity = f"retry {status.get('attempt', '?')}: {status.get('message', '')}"
+                    self._set_activity(
+                        state,
+                        f"retry {status.get('attempt', '?')}: {status.get('message', '')}",
+                    )
                 elif status.get("type") == "busy" and not state.activity:
-                    state.activity = "working"
+                    self._set_activity(state, "working")
                 if state.in_flight_event_id:
                     self.schedule_live_edit(room_id, state)
             return
@@ -409,7 +419,16 @@ class MatrixOpenCodeBot:
                     for todo in todos
                     if isinstance(todo, dict) and todo.get("status") == "completed"
                 )
-                state.activity = f"Plan progress: {completed}/{len(todos)} tasks"
+                state.plan_items = [
+                    (
+                        _safe_plan_text(todo.get("content") or todo.get("title")),
+                        str(todo.get("status") or "pending"),
+                    )
+                    for todo in todos
+                    if isinstance(todo, dict)
+                    and (todo.get("content") or todo.get("title"))
+                ][:8]
+                self._set_activity(state, f"Plan progress: {completed}/{len(todos)} tasks")
                 self.schedule_live_edit(room_id, state)
             return
 
@@ -495,22 +514,53 @@ class MatrixOpenCodeBot:
     def _combined_text(state: RoomSession) -> str:
         return "".join(state.text_parts.values()).strip()
 
-    @staticmethod
-    def _progress_text(state: RoomSession) -> str:
+    def _progress_text(self, state: RoomSession) -> str:
         activity = state.activity or "Working"
-        status_line = f"⏳ {activity}"
+        elapsed = _elapsed_text(state.prompt_started_ms)
+        status_line = f"⏳ {activity}{f' · {elapsed}' if elapsed else ''}"
+        details: list[str] = []
+        if state.plan_items:
+            completed = sum(1 for _, status in state.plan_items if status == "completed")
+            plan = [f"📋 Plan ({completed}/{len(state.plan_items)} complete):"]
+            plan.extend(
+                f"{_plan_marker(status)} {title}"
+                for title, status in state.plan_items[:5]
+            )
+            if len(state.plan_items) > 5:
+                plan.append(f"…and {len(state.plan_items) - 5} more")
+            details.append("\n".join(plan))
+        if state.activity_history:
+            details.append("Recent: " + " → ".join(state.activity_history[-3:]))
+        progress = "\n".join([status_line, *details])
         response = MatrixOpenCodeBot._combined_text(state)
-        if not response:
-            return f"Working…\n{status_line}"
-        available = max(1, MAX_MESSAGE_CHARS - len(status_line) - 2)
-        return f"{response[:available]}\n\n{status_line}"
+        reasoning = "".join(state.reasoning_parts.values()).strip()
+        if len(reasoning) > MAX_REASONING_CHARS:
+            reasoning = "…" + reasoning[-MAX_REASONING_CHARS:]
+        reasoning_block = f"🧠 Thinking:\n{reasoning}" if reasoning else ""
+        supplemental = "\n\n".join(
+            section for section in (reasoning_block, progress) if section
+        )
+        if response:
+            available = max(1, MAX_MESSAGE_CHARS - len(supplemental) - 2)
+            return f"{response[:available]}\n\n{supplemental}"
+        return f"Working…\n{supplemental}"[:MAX_MESSAGE_CHARS]
+
+    @staticmethod
+    def _set_activity(state: RoomSession, activity: str) -> None:
+        if state.activity and state.activity != activity and state.activity != "starting":
+            state.activity_history.append(state.activity)
+            del state.activity_history[:-6]
+        state.activity = activity
 
     @staticmethod
     def _clear_in_flight(state: RoomSession) -> None:
         state.in_flight_event_id = None
         state.prompt_started_ms = None
         state.text_parts.clear()
+        state.reasoning_parts.clear()
         state.activity = None
+        state.activity_history.clear()
+        state.plan_items.clear()
         state.stop_requested = False
 
     async def validate_restored_state(self) -> None:
@@ -652,6 +702,31 @@ def _safe_activity_label(value: Any) -> str:
         if character.isalnum() or character in {"_", "-", ".", ":"}
     )
     return label[:80] or "unknown"
+
+
+def _safe_plan_text(value: Any) -> str:
+    return " ".join(str(value).split())[:160]
+
+
+def _plan_marker(status: str) -> str:
+    if status == "completed":
+        return "✓"
+    if status in {"in_progress", "in-progress", "running"}:
+        return "→"
+    return "·"
+
+
+def _elapsed_text(started_ms: int | None) -> str:
+    if not started_ms:
+        return ""
+    seconds = max(0, (int(time.time() * 1000) - started_ms) // 1000)
+    if seconds < 60:
+        return f"{seconds}s elapsed"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s elapsed"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m elapsed"
 
 
 def _integer(value: Any) -> int:

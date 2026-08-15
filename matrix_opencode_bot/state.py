@@ -31,7 +31,10 @@ class RoomSession:
 
     # Transient event aggregation fields are deliberately not persisted.
     text_parts: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
+    reasoning_parts: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
     activity: str | None = field(default=None, repr=False, compare=False)
+    activity_history: list[str] = field(default_factory=list, repr=False, compare=False)
+    plan_items: list[tuple[str, str]] = field(default_factory=list, repr=False, compare=False)
     stop_requested: bool = field(default=False, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:

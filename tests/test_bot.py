@@ -7,7 +7,7 @@ from matrix_opencode_bot.config import Settings
 from matrix_opencode_bot.state import PendingPermission, RoomSession, StateStore
 
 
-def settings(tmp_path: Path) -> Settings:
+def settings(tmp_path: Path, *, show_reasoning: bool = False) -> Settings:
     work = tmp_path.resolve()
     return Settings(
         homeserver="https://matrix.example",
@@ -24,10 +24,11 @@ def settings(tmp_path: Path) -> Settings:
         opencode_password=None,
         default_directory=work,
         allowed_roots=(work,),
+        show_reasoning=show_reasoning,
     )
 
 
-def make_bot(tmp_path: Path):
+def make_bot(tmp_path: Path, *, show_reasoning: bool = False):
     counter = 0
 
     async def room_send(**_: object):
@@ -47,7 +48,9 @@ def make_bot(tmp_path: Path):
         get_session=AsyncMock(return_value={"id": "ses_1", "title": "Matrix"}),
     )
     store = StateStore(tmp_path / "state.json")
-    bot = MatrixOpenCodeBot(matrix, settings(tmp_path), opencode, store)
+    bot = MatrixOpenCodeBot(
+        matrix, settings(tmp_path, show_reasoning=show_reasoning), opencode, store
+    )
     return bot, matrix, opencode, store
 
 
@@ -192,6 +195,69 @@ async def test_reasoning_phase_is_reported_without_reasoning_text(tmp_path: Path
     await bot.edit_tasks["!one:example"]
     progress = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
     assert "Reasoning" in progress
+    assert "private internal reasoning" not in progress
+
+
+async def test_provider_reasoning_can_be_streamed_to_chat(tmp_path: Path) -> None:
+    bot, matrix, _, store = make_bot(tmp_path, show_reasoning=True)
+    store.rooms["!one:example"] = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$progress", prompt_started_ms=1
+    )
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "reasoning", "sessionID": "ses_1", "type": "reasoning",
+                    "text": "Inspecting the event handler before changing it.",
+                }
+            },
+        },
+    })
+    await bot.edit_tasks["!one:example"]
+    progress = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
+    assert "Thinking:" in progress
+    assert "Inspecting the event handler before changing it." in progress
+
+
+async def test_reasoning_progress_shows_plan_and_recent_activity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.time", lambda: 1_000.0)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$progress",
+        prompt_started_ms=935_000,
+    )
+    state.activity = "Using tool: rg"
+    state.activity_history = ["Starting next step"]
+    state.plan_items = [
+        ("Inspect progress events", "completed"),
+        ("Improve the chat indicator", "in_progress"),
+    ]
+    store.rooms["!one:example"] = state
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "reasoning", "sessionID": "ses_1", "type": "reasoning",
+                    "text": "private internal reasoning",
+                }
+            },
+        },
+    })
+    await bot.edit_tasks["!one:example"]
+
+    progress = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
+    assert "Reasoning · 1m 05s elapsed" in progress
+    assert "Plan (1/2 complete)" in progress
+    assert "✓ Inspect progress events" in progress
+    assert "→ Improve the chat indicator" in progress
+    assert "Starting next step → Using tool: rg" in progress
     assert "private internal reasoning" not in progress
 
 

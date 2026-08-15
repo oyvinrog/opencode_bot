@@ -22,6 +22,15 @@ def test_settings_parse_required_values(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert settings.allowed_rooms == frozenset({"!one:example", "!two:example"})
     assert settings.allowed_senders == frozenset({"@alice:example"})
     assert settings.opencode_url == "http://127.0.0.1:4096"
+    assert settings.show_reasoning is False
+
+
+def test_settings_can_enable_reasoning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("MATRIX_SHOW_REASONING", "true")
+    assert Settings.from_env().show_reasoning is True
 
 
 @pytest.mark.parametrize("missing", ["MATRIX_ALLOWED_ROOMS", "MATRIX_ALLOWED_SENDERS"])

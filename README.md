@@ -103,11 +103,18 @@ session is busy. New sessions also leave earlier OpenCode sessions and their
 changes intact.
 
 Assistant text and safe progress are relayed through Matrix `m.replace` edits at
-most once per second. While busy, the progress message shows phases, tool names
-and status, retries, subagents, plan counts, and file-update counts. Raw hidden
-reasoning, tool arguments, commands, and file names are not posted. Permission
-requests and errors are sent immediately. Replies longer than 20,000 characters
-are split at completion.
+most once per second. While busy, the progress message shows elapsed time, the
+current plan item, plan completion, recent phases, tool names and status, retries,
+subagents, and file-update counts. Raw hidden reasoning, tool arguments, and
+commands are not posted; user-visible plan descriptions may mention files.
+Permission requests and errors are sent immediately. Replies longer than 20,000
+characters are split at completion.
+
+Set `MATRIX_SHOW_REASONING=true` to also stream the provider-exposed reasoning
+text that OpenCode displays in its thinking view. This text is shown only while
+the response is in progress and is removed when the final answer replaces the
+live message. It can contain sensitive workspace or prompt context, so enable it
+only for rooms whose members are allowed to see that material.
 
 ## Persistence and recovery
 
