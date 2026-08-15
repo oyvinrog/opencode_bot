@@ -87,10 +87,12 @@ deletes the OpenCode session nor reverts files, and it is refused while the
 session is busy. New sessions also leave earlier OpenCode sessions and their
 changes intact.
 
-Assistant text is relayed through Matrix `m.replace` edits at most once per
-second. Reasoning and tool internals are not posted. Permission requests and
-errors are sent immediately. Replies longer than 20,000 characters are split at
-completion.
+Assistant text and safe progress are relayed through Matrix `m.replace` edits at
+most once per second. While busy, the progress message shows phases, tool names
+and status, retries, subagents, plan counts, and file-update counts. Raw hidden
+reasoning, tool arguments, commands, and file names are not posted. Permission
+requests and errors are sent immediately. Replies longer than 20,000 characters
+are split at completion.
 
 ## Persistence and recovery
 

@@ -352,17 +352,42 @@ class MatrixOpenCodeBot:
             part = properties.get("part", {})
             if not isinstance(part, dict):
                 return
-            if part.get("type") == "text" and not part.get("ignored"):
+            part_type = part.get("type")
+            if part_type == "text" and not part.get("ignored"):
                 state.text_parts[str(part.get("id", len(state.text_parts)))] = str(part.get("text", ""))
                 self.schedule_live_edit(room_id, state)
-            elif part.get("type") == "tool":
+            elif part_type == "reasoning":
+                # Deliberately report the phase without relaying private chain-of-thought.
+                state.activity = "Reasoning"
+                self.schedule_live_edit(room_id, state)
+            elif part_type == "tool":
                 tool_state = part.get("state", {})
                 if isinstance(tool_state, dict):
-                    status = tool_state.get("status")
-                    if status in {"pending", "running"}:
-                        state.activity = str(tool_state.get("title") or part.get("tool") or "tool")
-                    elif status == "error":
-                        state.activity = f"{part.get('tool', 'tool')} failed"
+                    status = str(tool_state.get("status") or "pending")
+                    tool = _safe_activity_label(part.get("tool") or "tool")
+                    verb = {
+                        "pending": "Preparing tool",
+                        "running": "Using tool",
+                        "completed": "Completed tool",
+                        "error": "Tool failed",
+                    }.get(status, "Tool")
+                    state.activity = f"{verb}: {tool}"
+                    self.schedule_live_edit(room_id, state)
+            elif part_type == "patch":
+                files = part.get("files", [])
+                count = len(files) if isinstance(files, list) else 0
+                state.activity = f"Updated {count} file{'s' if count != 1 else ''}"
+                self.schedule_live_edit(room_id, state)
+            elif part_type in {"agent", "subtask"}:
+                agent = _safe_activity_label(part.get("name") or part.get("agent") or "agent")
+                state.activity = f"Running agent: {agent}"
+                self.schedule_live_edit(room_id, state)
+            elif part_type == "step-start":
+                state.activity = "Starting next step"
+                self.schedule_live_edit(room_id, state)
+            elif part_type == "step-finish":
+                state.activity = "Step completed"
+                self.schedule_live_edit(room_id, state)
             return
 
         if event_type == "session.status":
@@ -372,6 +397,20 @@ class MatrixOpenCodeBot:
                     state.activity = f"retry {status.get('attempt', '?')}: {status.get('message', '')}"
                 elif status.get("type") == "busy" and not state.activity:
                     state.activity = "working"
+                if state.in_flight_event_id:
+                    self.schedule_live_edit(room_id, state)
+            return
+
+        if event_type == "todo.updated" and state.in_flight_event_id:
+            todos = properties.get("todos", [])
+            if isinstance(todos, list):
+                completed = sum(
+                    1
+                    for todo in todos
+                    if isinstance(todo, dict) and todo.get("status") == "completed"
+                )
+                state.activity = f"Plan progress: {completed}/{len(todos)} tasks"
+                self.schedule_live_edit(room_id, state)
             return
 
         if event_type == "session.error" and state.in_flight_event_id:
@@ -397,10 +436,9 @@ class MatrixOpenCodeBot:
             if elapsed < EDIT_INTERVAL_SECONDS:
                 await asyncio.sleep(EDIT_INTERVAL_SECONDS - elapsed)
             if state.in_flight_event_id:
-                text = self._combined_text(state)
-                if text:
-                    await self.send_edit(room_id, state.in_flight_event_id, text[:MAX_MESSAGE_CHARS])
-                    self.last_edit[room_id] = time.monotonic()
+                text = self._progress_text(state)
+                await self.send_edit(room_id, state.in_flight_event_id, text)
+                self.last_edit[room_id] = time.monotonic()
 
         self.edit_tasks[room_id] = asyncio.create_task(update())
 
@@ -456,6 +494,16 @@ class MatrixOpenCodeBot:
     @staticmethod
     def _combined_text(state: RoomSession) -> str:
         return "".join(state.text_parts.values()).strip()
+
+    @staticmethod
+    def _progress_text(state: RoomSession) -> str:
+        activity = state.activity or "Working"
+        status_line = f"⏳ {activity}"
+        response = MatrixOpenCodeBot._combined_text(state)
+        if not response:
+            return f"Working…\n{status_line}"
+        available = max(1, MAX_MESSAGE_CHARS - len(status_line) - 2)
+        return f"{response[:available]}\n\n{status_line}"
 
     @staticmethod
     def _clear_in_flight(state: RoomSession) -> None:
@@ -595,6 +643,15 @@ def _event_error(error: Any) -> str:
     if isinstance(data, dict) and data.get("message"):
         return str(data["message"])
     return str(error.get("message") or error.get("name") or "unknown error")
+
+
+def _safe_activity_label(value: Any) -> str:
+    label = "".join(
+        character
+        for character in str(value)
+        if character.isalnum() or character in {"_", "-", ".", ":"}
+    )
+    return label[:80] or "unknown"
 
 
 def _integer(value: Any) -> int:

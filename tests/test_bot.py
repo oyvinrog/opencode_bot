@@ -146,6 +146,55 @@ async def test_text_event_and_idle_finalize_with_matrix_edit(tmp_path: Path) -> 
     assert store.rooms["!one:example"].in_flight_event_id is None
 
 
+async def test_tool_progress_is_reported_without_tool_arguments(tmp_path: Path) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$progress", prompt_started_ms=1
+    )
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "tool-part", "sessionID": "ses_1", "type": "tool",
+                    "tool": "bash", "state": {
+                        "status": "running", "input": {"command": "secret-command"},
+                        "title": "secret-command",
+                    },
+                }
+            },
+        },
+    })
+    await bot.edit_tasks["!one:example"]
+    progress = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
+    assert "Using tool: bash" in progress
+    assert "secret-command" not in progress
+
+
+async def test_reasoning_phase_is_reported_without_reasoning_text(tmp_path: Path) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$progress", prompt_started_ms=1
+    )
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "reasoning", "sessionID": "ses_1", "type": "reasoning",
+                    "text": "private internal reasoning",
+                }
+            },
+        },
+    })
+    await bot.edit_tasks["!one:example"]
+    progress = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
+    assert "Reasoning" in progress
+    assert "private internal reasoning" not in progress
+
+
 async def test_permission_is_scoped_to_matching_room_and_can_be_answered(tmp_path: Path) -> None:
     bot, matrix, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
