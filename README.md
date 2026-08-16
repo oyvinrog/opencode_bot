@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="matrix_opencode_bot/assets/openbot-logo.png" alt="OpenBot" width="760">
+</p>
+
 # Matrix–OpenCode bot
 
 An end-to-end encrypted Matrix bot that controls an OpenCode coding session. Each
@@ -6,6 +10,13 @@ prompts, and responses are streamed back by editing a Matrix message.
 
 The bot connects to an `opencode serve` process through its HTTP API. The included
 `run.sh` launcher starts and supervises both processes for local use.
+
+## Example chats
+
+![Fictitious OpenBot conversations in Element-style desktop and mobile clients](docs/images/element-chat-examples.png)
+
+*Fictitious examples showing how OpenBot conversations can look in Element on
+desktop and mobile.*
 
 ## Requirements and setup
 
@@ -60,6 +71,11 @@ the access token and encryption keys under `MATRIX_DATA_DIR`. Remove the Matrix
 password from `.env` after the first successful login. Keep the entire data
 directory private and persistent. Existing `data/session.json` and
 `data/crypto_store` files from the ELIZA example are reused unchanged.
+
+After the initial sync, the bot posts an OpenBot welcome banner to every allowed
+room it has joined. The banner is sent as native Matrix image media, including
+encrypted-media metadata for encrypted rooms and dimensions that Element uses to
+scale it cleanly on mobile and desktop.
 
 Verify the new **Matrix OpenCode bot** device in Element or another full Matrix
 client. The bot refuses to send to unverified recipient devices by default.

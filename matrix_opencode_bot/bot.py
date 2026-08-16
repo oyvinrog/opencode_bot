@@ -80,6 +80,9 @@ SESSION_REMINDER = (
     "Commands: !new [directory], !pursue <goal>, !status, !diagnose, !bump, !diff, "
     "!stop, !reset, !help"
 )
+STARTUP_LOGO_PATH = Path(__file__).with_name("assets") / "openbot-logo.png"
+STARTUP_LOGO_WIDTH = 1280
+STARTUP_LOGO_HEIGHT = 720
 
 DIAGNOSTIC_SECRET_KEY = re.compile(
     r"(^|[_-])(access[_-]?token|authorization|cookie|credential|password|secret|api[_-]?key)($|[_-])",
@@ -2114,6 +2117,65 @@ Return exactly:
         LOG.debug("Matrix send response: %s", response)
         return str(event_id) if event_id else None
 
+    async def send_startup_logos(self) -> None:
+        """Post the OpenBot banner to each configured room joined at startup."""
+
+        joined_rooms = getattr(self.client, "rooms", {})
+        for room_id in sorted(self.settings.allowed_rooms):
+            room = joined_rooms.get(room_id)
+            if room is None:
+                LOG.warning("Cannot send startup logo; bot is not joined to %s", room_id)
+                continue
+            try:
+                await self.send_image(
+                    room_id,
+                    STARTUP_LOGO_PATH,
+                    encrypted=bool(getattr(room, "encrypted", False)),
+                )
+            except Exception:
+                # A welcome image must never prevent the bot from serving other rooms.
+                LOG.exception("Could not send startup logo to %s", room_id)
+
+    async def send_image(self, room_id: str, path: Path, *, encrypted: bool) -> None:
+        """Upload and send an image using Matrix's encrypted-media shape when needed."""
+
+        size = path.stat().st_size
+        response, decryption_info = await self.client.upload(
+            lambda _got_429, _got_timeouts: path,
+            content_type="image/png",
+            filename=path.name,
+            encrypt=encrypted,
+            filesize=size,
+        )
+        content_uri = getattr(response, "content_uri", None)
+        if not content_uri:
+            raise RuntimeError(f"Matrix media upload failed: {response}")
+
+        content: dict[str, Any] = {
+            "msgtype": "m.image",
+            "body": "OpenBot is online",
+            "info": {
+                "mimetype": "image/png",
+                "size": size,
+                "w": STARTUP_LOGO_WIDTH,
+                "h": STARTUP_LOGO_HEIGHT,
+            },
+        }
+        if encrypted:
+            if not decryption_info:
+                raise RuntimeError("Matrix encrypted media upload returned no decryption info")
+            content["file"] = {**decryption_info, "url": content_uri}
+        else:
+            content["url"] = content_uri
+
+        await self.client.room_send(
+            room_id=room_id,
+            message_type="m.room.message",
+            content=content,
+            ignore_unverified_devices=self.settings.ignore_unverified_devices,
+        )
+        self.last_edit[room_id] = time.monotonic()
+
     async def send_edit(self, room_id: str, event_id: str, body: str) -> None:
         content = {
             "msgtype": "m.text",
@@ -2546,6 +2608,7 @@ async def run() -> None:
             # Load membership and crypto state before edits used for restart recovery.
             await client.sync(timeout=30_000, full_state=True, set_presence="online")
             event_task = asyncio.create_task(bot.run_event_loop())
+            await bot.send_startup_logos()
             await bot.validate_restored_state()
             await bot.resume_pursuits()
             bot.start_watchdog()

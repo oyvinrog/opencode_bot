@@ -22,6 +22,9 @@ matrix-opencode = "matrix_opencode_bot.bot:main"
 [tool.setuptools.packages.find]
 include = ["matrix_opencode_bot*"]
 
+[tool.setuptools.package-data]
+matrix_opencode_bot = ["assets/*.png"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

@@ -43,7 +43,12 @@ def make_bot(tmp_path: Path, *, show_reasoning: bool = False):
         counter += 1
         return SimpleNamespace(event_id=f"$event{counter}")
 
-    matrix = SimpleNamespace(user_id="@bot:example", room_send=AsyncMock(side_effect=room_send))
+    matrix = SimpleNamespace(
+        user_id="@bot:example",
+        rooms={},
+        room_send=AsyncMock(side_effect=room_send),
+        upload=AsyncMock(),
+    )
     opencode = SimpleNamespace(
         health=AsyncMock(return_value={"healthy": True, "version": "test"}),
         session_status=AsyncMock(return_value={}),
@@ -182,6 +187,48 @@ async def test_new_session_includes_command_reminder(tmp_path: Path) -> None:
     assert "!bump" in body
     assert "!diagnose" in body
     assert "!obsess" not in body
+
+
+async def test_startup_logo_is_encrypted_and_sized_for_element(tmp_path: Path) -> None:
+    bot, matrix, _, _ = make_bot(tmp_path)
+    matrix.rooms = {
+        "!one:example": SimpleNamespace(encrypted=True),
+        "!two:example": SimpleNamespace(encrypted=True),
+    }
+    matrix.upload.return_value = (
+        SimpleNamespace(content_uri="mxc://example/logo"),
+        {
+            "key": {"kty": "oct", "k": "secret"},
+            "iv": "iv",
+            "hashes": {"sha256": "hash"},
+            "v": "v2",
+        },
+    )
+
+    await bot.send_startup_logos()
+
+    assert matrix.upload.await_count == 2
+    assert all(call.kwargs["encrypt"] is True for call in matrix.upload.await_args_list)
+    content = matrix.room_send.await_args.kwargs["content"]
+    assert content["msgtype"] == "m.image"
+    assert content["body"] == "OpenBot is online"
+    assert content["info"]["w"] == 1280
+    assert content["info"]["h"] == 720
+    assert content["file"]["url"] == "mxc://example/logo"
+    assert "url" not in content
+
+
+async def test_startup_logo_uses_plain_media_for_unencrypted_room(tmp_path: Path) -> None:
+    bot, matrix, _, _ = make_bot(tmp_path)
+    matrix.rooms = {"!one:example": SimpleNamespace(encrypted=False)}
+    matrix.upload.return_value = (SimpleNamespace(content_uri="mxc://example/logo"), None)
+
+    await bot.send_startup_logos()
+
+    assert matrix.upload.await_args.kwargs["encrypt"] is False
+    content = matrix.room_send.await_args.kwargs["content"]
+    assert content["url"] == "mxc://example/logo"
+    assert "file" not in content
 
 
 async def test_diagnose_writes_redacted_local_report(tmp_path: Path) -> None:
