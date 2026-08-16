@@ -104,7 +104,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!help` — show the command list
 - `!new [directory]` — create a new session, using the default directory when omitted
 - Ordinary messages — prompt the current session, creating one in the default directory if needed
-- `!pursue <goal>` — pursue a goal until independently verified or `!stop`
+- `!pursue <goal>` — choose extent 1–3, then pursue until independently verified or `!stop`
 - `!status` — show the session, directory, activity, permissions, and change totals
 - `!diagnose` — write `DIAGNOSIS.txt` in the mapped session directory
 - `!bump` — report inactivity and ask before restarting the same stalled turn
@@ -130,8 +130,10 @@ redacted, but arbitrary prompts, model/tool output, paths, and source diffs can
 still contain private data. Inspect `DIAGNOSIS.txt` before copying or sharing it.
 
 Starting a session posts a compact reminder of the available commands. `!pursue`
-starts a fresh worker when the room already has a session, preventing a large or
-poisoned ordinary-chat transcript from contaminating the pursuit. It also creates
+first asks for an extent: `1` reaches the evidenced goal, `2` checks the important
+alternatives and contradictions, and `3` systematically exhausts every plausible
+avenue and may run for hours. After the choice, it starts a fresh worker, preventing
+a large or poisoned ordinary-chat transcript from contaminating the pursuit. It also creates
 a separate verifier session that freezes task-aware acceptance criteria. The bot
 assigns stable IDs to those criteria, so completion does not depend on the model
 repeating punctuation exactly. Literal schema placeholders and duplicate criteria

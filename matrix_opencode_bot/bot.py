@@ -64,10 +64,31 @@ envelope in the requested schema and no text outside it."""
 VERIFIER_TOOLS = {"write": False, "edit": False, "apply_patch": False, "task": False}
 PURSUIT_WORKER_TOOLS = {"task": False}
 
+
+def _pursuit_extent_instruction(extent: int) -> str:
+    if extent == 3:
+        return (
+            "Exhaustive coverage. Build and maintain a systematic map of every plausible search "
+            "space, interpretation, lead, alternative, and contradictory source. Do not accept a "
+            "merely sufficient answer: continue until each plausible avenue is either checked or "
+            "documented as inaccessible after concrete attempts. This mode may run for hours."
+        )
+    if extent == 2:
+        return (
+            "Broad coverage. Go beyond the first sufficient answer: investigate the main "
+            "alternatives, likely edge cases, independent sources, and contradictory evidence. "
+            "Complete only when the important plausible avenues have been checked."
+        )
+    return (
+        "Goal-directed coverage. Satisfy every mandatory acceptance criterion with reliable "
+        "evidence, then complete without requiring an unnecessary survey of marginal avenues."
+    )
+
+
 HELP = """Matrix–OpenCode commands:
 !new [directory] — start a session
 Ordinary messages — prompt the current session, creating one if needed
-!pursue <goal> — pursue a goal until independently verified or !stop
+!pursue <goal> — choose a search depth, then pursue until independently verified or !stop
 !status — show current activity
 !diagnose — write a detailed DIAGNOSIS.txt in the session directory
 !bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
@@ -217,7 +238,8 @@ class MatrixOpenCodeBot:
     async def command_new(self, room_id: str, requested: str | None) -> None:
         current = self.store.rooms.get(room_id)
         if current and (
-            current.pursuit_goal
+            current.pending_pursuit_goal
+            or current.pursuit_goal
             or current.in_flight_event_id
             or (await self._status(current)).get("type") != "idle"
         ):
@@ -258,6 +280,9 @@ class MatrixOpenCodeBot:
             except ValueError as exc:
                 await self.send_text(room_id, f"Cannot automatically start session: {exc}")
                 return
+        if state.pending_pursuit_goal:
+            await self._select_pursuit_extent(room_id, state, text)
+            return
         if state.pursuit_goal and state.pursuit_phase == "waiting_input":
             await self._resume_pursuit_with_input(room_id, state, text)
             return
@@ -360,6 +385,12 @@ class MatrixOpenCodeBot:
             except ValueError as exc:
                 await self.send_text(room_id, f"Cannot automatically start session: {exc}")
                 return
+        if state.pending_pursuit_goal:
+            await self.send_text(
+                room_id,
+                "A pursuit is awaiting its extent choice. Reply 1, 2, or 3, or use !stop.",
+            )
+            return
         if state.pursuit_goal:
             await self.send_text(
                 room_id, "A pursuit is already active. Use !stop before starting another."
@@ -369,7 +400,44 @@ class MatrixOpenCodeBot:
         if state.in_flight_event_id or status.get("type") != "idle":
             await self.send_text(room_id, "This session is busy. Wait for it to finish or use !stop.")
             return
-        if not created:
+        state.pending_pursuit_goal = goal
+        state.pending_pursuit_reuse_session = created
+        await self.store.save()
+        if created:
+            await self.send_text(
+                room_id,
+                f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}"
+                f"\n\n{SESSION_REMINDER}",
+            )
+        await self.send_text(
+            room_id,
+            "How extensive should this pursuit be? Reply with a number:\n"
+            "1 — Reach the goal: stop once every acceptance criterion is evidenced.\n"
+            "2 — Turn most stones: search broadly, test alternatives, and check contradictions.\n"
+            "3 — Exhaustive (\u201cautistic mode\u201d): systematically turn every plausible stone; "
+            "this may run for hours.\n\nUse !stop to cancel.",
+        )
+
+    async def _select_pursuit_extent(
+        self, room_id: str, state: RoomSession, response: str
+    ) -> None:
+        choice = response.strip()
+        if choice not in {"1", "2", "3"}:
+            await self.send_text(
+                room_id,
+                "Please reply with 1 (reach the goal), 2 (turn most stones), or "
+                "3 (systematically turn every plausible stone). Use !stop to cancel.",
+            )
+            return
+        goal = state.pending_pursuit_goal
+        if not goal:
+            return
+        status = await self._status(state)
+        if state.in_flight_event_id or status.get("type") != "idle":
+            await self.send_text(room_id, "This session became busy. Use !stop and try again.")
+            return
+        reuse_session = state.pending_pursuit_reuse_session
+        if not reuse_session:
             # A pursuit should not inherit an arbitrarily large or previously poisoned chat
             # transcript. The goal and durable pursuit state are the context it actually needs.
             worker = await self.opencode.create_session(
@@ -386,15 +454,11 @@ class MatrixOpenCodeBot:
         state.watchdog_recovery_pending = False
         state.watchdog_recovery_attempts = 0
         state.pursuit_goal = goal
+        state.pursuit_extent = int(choice)
         state.pursuit_phase = "specifying"
         state.verifier_session_id = str(verifier["id"])
         await self.store.save()
-        if created:
-            await self.send_text(
-                room_id,
-                f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}"
-                f"\n\n{SESSION_REMINDER}",
-            )
+        await self.send_text(room_id, f"Pursuit extent set to {choice}/3.")
         await self._submit_verifier(room_id, state, self._specification_prompt(state))
 
     async def _submit_verifier(
@@ -418,6 +482,7 @@ class MatrixOpenCodeBot:
     @staticmethod
     def _specification_prompt(state: RoomSession) -> str:
         clarification = "\n".join(state.pursuit_assumptions[-5:]) or "None"
+        extent = _pursuit_extent_instruction(state.pursuit_extent)
         return f"""Define a stable acceptance contract for this goal:
 
 {state.pursuit_goal}
@@ -425,12 +490,17 @@ class MatrixOpenCodeBot:
 User clarifications already received:
 {clarification}
 
+Requested pursuit extent ({state.pursuit_extent}/3):
+{extent}
+
 Infer harmless details. Ask for input only if a missing fact would materially change the result.
 Return exactly one tagged JSON object with this shape:
 <pursuit-control>{{"type":"contract","criteria":["<concrete criterion derived from the goal>"],"assumptions":["<explicit harmless assumption, or use an empty array>"],"needs_input":false,"question":null}}</pursuit-control>
 Replace every angle-bracketed instruction with goal-specific content; copied placeholders make the
 contract invalid. Criteria must be task-aware, mandatory, and objectively checkable where possible.
-Normally provide 2-6 non-overlapping criteria. Do not perform the task yet."""
+The contract must encode the requested extent: levels 2 and 3 require a mandatory breadth or
+exhaustion criterion that cannot pass on merely sufficient goal evidence. Normally provide 2-6
+non-overlapping criteria. Do not perform the task yet."""
 
     @staticmethod
     def _worker_prompt(state: RoomSession, *, reset: bool = False) -> str:
@@ -450,9 +520,13 @@ Normally provide 2-6 non-overlapping criteria. Do not perform the task yet."""
             if reset
             else "Continue from the existing session state."
         )
+        extent = _pursuit_extent_instruction(state.pursuit_extent)
         return f"""Pursue this goal and make concrete progress in this pass:
 
 {state.pursuit_goal}
+
+Requested pursuit extent ({state.pursuit_extent}/3):
+{extent}
 
 Frozen mandatory acceptance criteria:
 {criteria}
@@ -499,9 +573,13 @@ Delegated task or subagent calls are disabled for pursuit workers; perform each 
             for item in state.pursuit_evidence[-12:]
         ) or "- None"
         prior_feedback = "\n".join(f"- {item}" for item in state.pursuit_reflections[-6:]) or "- None"
+        extent = _pursuit_extent_instruction(state.pursuit_extent)
         return f"""Independently evaluate the latest worker pass against the frozen contract.
 
 Goal: {state.pursuit_goal}
+
+Requested pursuit extent ({state.pursuit_extent}/3):
+{extent}
 
 Mandatory criteria:
 {criteria}
@@ -765,7 +843,10 @@ Return exactly:
 
     @staticmethod
     def _clear_pursuit(state: RoomSession) -> None:
+        state.pending_pursuit_goal = None
+        state.pending_pursuit_reuse_session = False
         state.pursuit_goal = None
+        state.pursuit_extent = 1
         state.pursuit_phase = None
         state.pursuit_iteration = 0
         state.pursuit_protocol_version = PURSUIT_PROTOCOL_VERSION
@@ -845,6 +926,11 @@ Return exactly:
             lines.append(f"Manual bump: attempt {state.manual_bump_attempts} pending")
         elif state.bump_confirmation_session_id:
             lines.append("Manual bump: awaiting !bump confirm or !bump cancel")
+        if state.pending_pursuit_goal:
+            lines.append(
+                f"Pursuit: awaiting extent (reply 1, 2, or 3) — "
+                f"{state.pending_pursuit_goal}"
+            )
         if state.pursuit_goal:
             passed = sum(
                 1 for status_value in state.pursuit_criteria_status.values()
@@ -854,6 +940,7 @@ Return exactly:
                 f"Pursuit: {state.pursuit_phase}, pass {state.pursuit_iteration} — "
                 f"{state.pursuit_goal}"
             )
+            lines.append(f"Extent: {state.pursuit_extent}/3")
             lines.append(
                 f"Acceptance: {passed}/{len(state.acceptance_criteria)} evidenced; "
                 f"stagnation {state.pursuit_stagnation_count}/3"
@@ -1198,7 +1285,7 @@ Return exactly:
         if not state:
             await self.send_text(room_id, "No session is mapped to this room.")
             return
-        was_pursuing = state.pursuit_goal is not None
+        was_pursuing = state.pursuit_goal is not None or state.pending_pursuit_goal is not None
         verifier = state.verifier_session_id
         active_session_id = self._active_session_id(state)
         active_was_verifier = bool(verifier and active_session_id == verifier)
@@ -1239,7 +1326,12 @@ Return exactly:
             await self.send_text(room_id, "This room has no session mapping.")
             return
         status = await self._status(state)
-        if state.pursuit_goal or state.in_flight_event_id or status.get("type") != "idle":
+        if (
+            state.pending_pursuit_goal
+            or state.pursuit_goal
+            or state.in_flight_event_id
+            or status.get("type") != "idle"
+        ):
             await self.send_text(room_id, "The session is busy. Use !stop before !reset.")
             return
         await self.store.remove(room_id)

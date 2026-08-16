@@ -281,6 +281,7 @@ async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> 
     ]
 
     await bot.command_pursue("!one:example", "Find the root cause")
+    await bot.prompt("!one:example", "1")
 
     state = store.rooms["!one:example"]
     assert state.pursuit_goal == "Find the root cause"
@@ -320,6 +321,46 @@ async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> 
     opencode.delete_session.assert_awaited_once_with("ses_verify", str(tmp_path))
     final = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
     assert "Pursuit complete" in final
+
+
+async def test_pursue_waits_for_extent_and_applies_exhaustive_mode(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+    opencode.create_session.side_effect = [
+        {"id": "ses_pursue", "title": "Pursuit worker"},
+        {"id": "ses_verify", "title": "Verifier"},
+    ]
+
+    await bot.command_pursue("!one:example", "Map the whole problem")
+
+    state = store.rooms["!one:example"]
+    assert state.pending_pursuit_goal == "Map the whole problem"
+    assert state.pursuit_goal is None
+    opencode.create_session.assert_not_awaited()
+    question = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "Reply with a number" in question
+    assert "may run for hours" in question
+
+    await bot.prompt("!one:example", "3")
+
+    assert state.pending_pursuit_goal is None
+    assert state.pursuit_goal == "Map the whole problem"
+    assert state.pursuit_extent == 3
+    assert "every plausible search space" in opencode.prompt_async.await_args.args[2]
+    assert "may run for hours" in opencode.prompt_async.await_args.args[2]
+
+
+async def test_invalid_pursuit_extent_keeps_waiting(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+
+    await bot.command_pursue("!one:example", "Investigate")
+    await bot.prompt("!one:example", "very")
+
+    state = store.rooms["!one:example"]
+    assert state.pending_pursuit_goal == "Investigate"
+    assert "Please reply with 1" in matrix.room_send.await_args.kwargs["content"]["body"]
+    opencode.create_session.assert_not_awaited()
 
 
 async def test_criterion_text_punctuation_is_not_part_of_verdict_protocol(
@@ -538,6 +579,7 @@ async def test_pursuit_pauses_for_material_input_and_normal_reply_resumes(
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Find a suitable product")
+    await bot.prompt("!one:example", "1")
 
     await pursuit_response(bot, tmp_path, "ses_verify", {
         "type": "contract",
@@ -599,6 +641,7 @@ async def test_invalid_verifier_envelope_is_hidden_and_repaired(tmp_path: Path) 
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Research carefully")
+    await bot.prompt("!one:example", "1")
 
     await pursuit_text_and_idle(bot, tmp_path, "ses_verify", "not valid control JSON")
     state = store.rooms["!one:example"]
@@ -619,6 +662,7 @@ async def test_bare_verifier_json_is_accepted_when_it_is_the_entire_response(
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Research current jobs")
+    await bot.prompt("!one:example", "1")
 
     await pursuit_text_and_idle(
         bot,
@@ -669,6 +713,7 @@ async def test_verifier_prompt_text_is_not_combined_with_assistant_contract(
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Research current jobs")
+    await bot.prompt("!one:example", "1")
 
     await bot.handle_opencode_event({
         "directory": str(tmp_path),
@@ -754,6 +799,7 @@ async def test_placeholder_acceptance_contract_is_rejected(tmp_path: Path) -> No
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Research current jobs")
+    await bot.prompt("!one:example", "1")
 
     await pursuit_response(bot, tmp_path, "ses_verify", {
         "type": "contract",
@@ -966,6 +1012,7 @@ async def test_pursuit_submission_error_retries_with_backoff(
     monkeypatch.setattr("matrix_opencode_bot.bot.asyncio.sleep", sleep)
 
     await bot.command_pursue("!one:example", "Keep trying")
+    await bot.prompt("!one:example", "1")
     await bot.retry_tasks["!one:example"]
 
     assert opencode.prompt_async.await_count == 2

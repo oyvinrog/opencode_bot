@@ -38,6 +38,13 @@ the world. Harmless gaps can be covered by stated assumptions. A missing fact
 that would materially change the result should instead cause the pursuit to ask
 the user.
 
+Before freezing that contract, the operator chooses an extent. Level 1 stops when
+the goal itself is evidenced. Level 2 also checks the important alternatives,
+edge cases, and contradictions. Level 3 maps every plausible avenue and continues
+until each has been checked or concrete attempts show that it is inaccessible;
+this can intentionally take hours. The chosen extent is part of the contract, so
+minimal evidence cannot prematurely complete a broad or exhaustive pursuit.
+
 Freezing the criteria matters. Without a stable contract, an agent can quietly
 move the goalposts until its current output appears successful. A frozen contract
 forces later evaluation to answer the harder question: did the work satisfy the

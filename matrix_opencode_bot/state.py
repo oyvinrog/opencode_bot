@@ -32,7 +32,10 @@ class RoomSession:
     in_flight_event_id: str | None = None
     prompt_started_ms: int | None = None
     pending_permissions: list[PendingPermission] = field(default_factory=list)
+    pending_pursuit_goal: str | None = None
+    pending_pursuit_reuse_session: bool = False
     pursuit_goal: str | None = None
+    pursuit_extent: int = 1
     pursuit_phase: str | None = None
     pursuit_iteration: int = 0
     pursuit_protocol_version: int = PURSUIT_PROTOCOL_VERSION
@@ -80,7 +83,10 @@ class RoomSession:
             "in_flight_event_id": self.in_flight_event_id,
             "prompt_started_ms": self.prompt_started_ms,
             "pending_permissions": [asdict(value) for value in self.pending_permissions],
+            "pending_pursuit_goal": self.pending_pursuit_goal,
+            "pending_pursuit_reuse_session": self.pending_pursuit_reuse_session,
             "pursuit_goal": self.pursuit_goal,
+            "pursuit_extent": self.pursuit_extent,
             "pursuit_phase": self.pursuit_phase,
             "pursuit_iteration": self.pursuit_iteration,
             "pursuit_protocol_version": self.pursuit_protocol_version,
@@ -130,7 +136,16 @@ class RoomSession:
             in_flight_event_id=value.get("in_flight_event_id"),
             prompt_started_ms=value.get("prompt_started_ms"),
             pending_permissions=permissions,
+            pending_pursuit_goal=(
+                str(value["pending_pursuit_goal"])
+                if value.get("pending_pursuit_goal")
+                else None
+            ),
+            pending_pursuit_reuse_session=bool(
+                value.get("pending_pursuit_reuse_session", False)
+            ),
             pursuit_goal=str(pursuit_goal) if pursuit_goal else None,
+            pursuit_extent=_pursuit_extent(value.get("pursuit_extent")),
             pursuit_phase=str(pursuit_phase) if pursuit_phase else None,
             pursuit_iteration=int(
                 value.get("pursuit_iteration") or value.get("obsess_iteration") or 0
@@ -204,6 +219,14 @@ class RoomSession:
                 value.get("watchdog_recovery_attempts") or 0
             ),
         )
+
+
+def _pursuit_extent(value: Any) -> int:
+    try:
+        extent = int(value or 1)
+    except (TypeError, ValueError):
+        return 1
+    return extent if extent in {1, 2, 3} else 1
 
 
 class StateStore:

@@ -17,7 +17,10 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
             in_flight_event_id="$event",
             prompt_started_ms=123,
             pending_permissions=[PendingPermission("perm_1", "Run", "bash", "git status", 5)],
+            pending_pursuit_goal="Await a depth choice",
+            pending_pursuit_reuse_session=True,
             pursuit_goal="Investigate thoroughly",
+            pursuit_extent=3,
             pursuit_phase="verifying",
             pursuit_iteration=7,
             pursuit_worker_input_tokens=42_000,
@@ -47,6 +50,9 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
     assert restored.rooms["!room:example"].session_id == "ses_1"
     assert restored.rooms["!room:example"].pending_permissions[0].pattern == "git status"
     assert restored.rooms["!room:example"].pursuit_goal == "Investigate thoroughly"
+    assert restored.rooms["!room:example"].pending_pursuit_goal == "Await a depth choice"
+    assert restored.rooms["!room:example"].pending_pursuit_reuse_session is True
+    assert restored.rooms["!room:example"].pursuit_extent == 3
     assert restored.rooms["!room:example"].pursuit_iteration == 7
     assert restored.rooms["!room:example"].verifier_session_id == "ses_verify"
     assert restored.rooms["!room:example"].pursuit_evidence[0]["claim"] == "Primary record found"
