@@ -378,6 +378,41 @@ async def test_invalid_verifier_envelope_is_hidden_and_repaired(tmp_path: Path) 
     assert "not valid control JSON" not in visible
 
 
+async def test_bare_verifier_json_is_accepted_when_it_is_the_entire_response(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_old", str(tmp_path))
+    opencode.create_session.side_effect = [
+        {"id": "ses_pursue"},
+        {"id": "ses_verify"},
+    ]
+    await bot.command_pursue("!one:example", "Research current jobs")
+
+    await pursuit_text_and_idle(
+        bot,
+        tmp_path,
+        "ses_verify",
+        json.dumps(
+            {
+                "type": "contract",
+                "criteria": ["Every listed role is currently open and located in Oslo"],
+                "assumptions": ["Roles advertised as hybrid in Oslo qualify"],
+                "needs_input": False,
+                "question": None,
+            }
+        ),
+    )
+
+    state = store.rooms["!one:example"]
+    assert state.pursuit_phase == "working"
+    assert state.pursuit_protocol_failures == 0
+    assert state.acceptance_criteria == [
+        "Every listed role is currently open and located in Oslo"
+    ]
+    assert opencode.prompt_async.await_args.args[0] == "ses_pursue"
+
+
 async def test_placeholder_acceptance_contract_is_rejected(tmp_path: Path) -> None:
     bot, _, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_old", str(tmp_path))
@@ -546,6 +581,51 @@ async def test_text_event_and_idle_finalize_with_matrix_edit(tmp_path: Path) -> 
     assert edit["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$progress"}
     assert edit["m.new_content"]["body"] == "Done"
     assert store.rooms["!one:example"].in_flight_event_id is None
+
+
+async def test_text_deltas_stream_and_are_compacted_in_diagnostics(tmp_path: Path) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$progress", prompt_started_ms=1
+    )
+    store.rooms["!one:example"] = state
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "answer", "sessionID": "ses_1", "type": "text", "text": ""
+                }
+            },
+        },
+    })
+    for delta in ("Hello", " world"):
+        await bot.handle_opencode_event({
+            "directory": str(tmp_path),
+            "payload": {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": "ses_1",
+                    "messageID": "msg_1",
+                    "partID": "answer",
+                    "field": "text",
+                    "delta": delta,
+                },
+            },
+        })
+
+    await bot.edit_tasks["!one:example"]
+    progress = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
+    assert progress.startswith("Hello world")
+    delta_events = [
+        event
+        for event in bot.diagnostic_events["!one:example"]
+        if event["type"] == "message.part.delta"
+    ]
+    assert len(delta_events) == 1
+    assert delta_events[0]["properties"]["delta"] == "Hello world"
+    assert delta_events[0]["properties"]["delta_count"] == 2
 
 
 async def test_tool_progress_is_reported_without_tool_arguments(tmp_path: Path) -> None:

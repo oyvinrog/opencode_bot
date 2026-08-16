@@ -107,7 +107,8 @@ session is busy. New sessions also leave earlier OpenCode sessions and their
 changes intact.
 
 `!diagnose` snapshots the mapped room state, transient progress, the last 200
-OpenCode events observed since the bot started, server health/status, and up to
+OpenCode event records observed since the bot started (with adjacent token deltas
+compacted), server health/status, and up to
 100 recent messages plus diffs for the worker, verifier, and quarantined recovery
 sessions. The report is written atomically with owner-only permissions and the bot
 replies with its absolute path. Credential-shaped fields and assignments are

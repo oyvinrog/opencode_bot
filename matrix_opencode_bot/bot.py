@@ -1384,16 +1384,59 @@ Return exactly:
             async with self.room_locks[room_id]:
                 if session_id != self._active_session_id(state):
                     continue
-                self.diagnostic_events[room_id].append(
-                    {
-                        "observed_utc": datetime.now(timezone.utc).isoformat(),
-                        "type": str(event_type),
-                        "session_id": session_id,
-                        "directory": str(directory or state.directory),
-                        "properties": _sanitize_diagnostic(properties, max_string=4000),
-                    }
+                self._record_diagnostic_event(
+                    room_id,
+                    state,
+                    str(event_type),
+                    session_id,
+                    directory,
+                    properties,
                 )
                 await self._handle_room_event(room_id, state, str(event_type), properties)
+
+    def _record_diagnostic_event(
+        self,
+        room_id: str,
+        state: RoomSession,
+        event_type: str,
+        session_id: str,
+        directory: Any,
+        properties: dict[str, Any],
+    ) -> None:
+        """Keep token streams useful without letting them evict lifecycle events."""
+
+        events = self.diagnostic_events[room_id]
+        if event_type == "message.part.delta" and events:
+            previous = events[-1]
+            previous_properties = previous.get("properties", {})
+            same_stream = (
+                previous.get("type") == event_type
+                and previous.get("session_id") == session_id
+                and isinstance(previous_properties, dict)
+                and previous_properties.get("partID") == properties.get("partID")
+                and previous_properties.get("field") == properties.get("field")
+            )
+            if same_stream:
+                combined = str(previous_properties.get("delta") or "") + str(
+                    properties.get("delta") or ""
+                )
+                previous_properties["delta"] = combined[-4000:]
+                previous_properties["delta_count"] = (
+                    _integer(previous_properties.get("delta_count")) or 1
+                ) + 1
+                previous["observed_utc"] = datetime.now(timezone.utc).isoformat()
+                return
+
+        event = {
+            "observed_utc": datetime.now(timezone.utc).isoformat(),
+            "type": event_type,
+            "session_id": session_id,
+            "directory": str(directory or state.directory),
+            "properties": _sanitize_diagnostic(properties, max_string=4000),
+        }
+        if event_type == "message.part.delta" and isinstance(event["properties"], dict):
+            event["properties"]["delta_count"] = 1
+        events.append(event)
 
     async def _handle_room_event(
         self,
@@ -1502,6 +1545,22 @@ Return exactly:
                 self.schedule_live_edit(room_id, state)
             elif part_type == "step-finish":
                 self._set_activity(state, "Step completed")
+                self.schedule_live_edit(room_id, state)
+            return
+
+        if event_type == "message.part.delta" and state.in_flight_event_id:
+            if properties.get("field") != "text":
+                return
+            part_id = str(properties.get("partID") or "")
+            delta = str(properties.get("delta") or "")
+            # OpenCode sends an initial part.updated event that identifies whether a
+            # text stream is assistant output or reasoning. Only append to a known part
+            # so an out-of-order reasoning delta can never leak into the response.
+            if part_id in state.text_parts:
+                state.text_parts[part_id] += delta
+                self.schedule_live_edit(room_id, state)
+            elif self.settings.show_reasoning and part_id in state.reasoning_parts:
+                state.reasoning_parts[part_id] += delta
                 self.schedule_live_edit(room_id, state)
             return
 
@@ -1951,10 +2010,19 @@ def render_diffs(diffs: list[dict[str, Any]]) -> str:
 
 def _parse_pursuit_control(text: str, phase: str | None) -> dict[str, Any] | None:
     matches = CONTROL_PATTERN.findall(text)
-    if len(matches) != 1:
+    if len(matches) == 1:
+        encoded = matches[0]
+    elif not matches:
+        # Some otherwise compliant models omit only the XML-style wrapper. Accept a
+        # bare object when it is the entire response, while continuing to reject JSON
+        # embedded in prose or multiple control envelopes.
+        encoded = text.strip()
+        if not (encoded.startswith("{") and encoded.endswith("}")):
+            return None
+    else:
         return None
     try:
-        value = json.loads(matches[0])
+        value = json.loads(encoded)
     except json.JSONDecodeError:
         return None
     if not isinstance(value, dict):
