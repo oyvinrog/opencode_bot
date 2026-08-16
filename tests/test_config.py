@@ -26,6 +26,7 @@ def test_settings_parse_required_values(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert settings.stuck_timeout_seconds == 900
     assert settings.pursuit_stuck_timeout_seconds == 180
     assert settings.pursuit_tool_timeout_seconds == 120
+    assert settings.pursuit_context_input_tokens == 250_000
     assert settings.matrix_edit_interval_seconds == 5
 
 
@@ -121,6 +122,7 @@ def test_stuck_timeout_must_be_positive(
     [
         ("OPENCODE_PURSUE_STUCK_TIMEOUT_SECONDS", "pursuit_stuck_timeout_seconds"),
         ("OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS", "pursuit_tool_timeout_seconds"),
+        ("OPENCODE_PURSUE_CONTEXT_INPUT_TOKENS", "pursuit_context_input_tokens"),
     ],
 )
 def test_pursuit_timeouts_must_be_positive(

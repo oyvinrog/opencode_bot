@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matrix-opencode-bot"
-version = "0.2.0"
+version = "0.3.0"
 description = "An end-to-end encrypted Matrix bridge for OpenCode"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -82,7 +82,8 @@ repeating an ungrounded belief merely makes the belief more expensive.
 
 `!pursue` separates doing the work from deciding whether the work is finished.
 The worker operates in the main session. A separate verifier session receives the
-goal, the frozen criteria, the worker's report, and the accumulated evidence. It
+goal, the frozen criteria with controller-assigned IDs, the worker's report, and
+the accumulated evidence. It
 then checks the important claims independently before returning one of three
 judgments:
 
@@ -120,19 +121,20 @@ mistakes simply because those mistakes occupy so much context. `!pursue` retains
 the information needed for the decision—what has been established, what failed,
 and what remains—rather than treating every generated token as equally valuable.
 
-When the same unmet criteria recur for three cycles without new evidence, the
-controller treats that as stagnation. It does not give up. It creates a fresh
-worker context supplied with the distilled memory and explicitly asks for a new
-strategy. Forgetting the conversational path while preserving the learned facts
-is a form of controlled escape from fixation.
+When the same unmet criteria recur for three cycles without new evidence, or the
+worker crosses its configured cumulative input-token threshold, the controller
+creates a fresh worker context supplied with the distilled memory and explicitly
+asks for a new strategy. Forgetting the conversational path while preserving the
+learned facts is a form of controlled escape from fixation.
 
 ## Completion Is a Claim That Requires Evidence
 
 The worker is not allowed to terminate the pursuit merely by saying “done.” The
-verifier must account for every frozen criterion, echo it exactly, assign it a
-status, and attach concrete evidence to a passing judgment. A malformed or
-incomplete verdict is rejected. Protocol errors are repaired, and repeated
-protocol failure causes the verifier itself to be recreated from persisted state.
+verifier must account for every frozen criterion ID exactly once, assign it a
+status, and attach structured claim, source, and verification evidence to a
+passing judgment. A malformed or incomplete verdict is rejected. Protocol errors
+are repaired, and repeated protocol failure causes the verifier itself to be
+recreated from persisted state.
 
 Automatic completion is therefore not the opposite of persistence. It is what
 makes persistence meaningful. An endless system cannot distinguish success from

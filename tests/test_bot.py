@@ -73,6 +73,21 @@ def room(room_id: str = "!one:example"):
     return SimpleNamespace(room_id=room_id, encrypted=True)
 
 
+def criteria(*texts: str) -> list[dict[str, str]]:
+    return [
+        {"id": f"c{index}", "text": text}
+        for index, text in enumerate(texts, start=1)
+    ]
+
+
+def evidence(
+    claim: str = "Independent inspection confirms the claim",
+    source: str = "/work/result.txt",
+    verification: str = "Opened the source and checked the relevant record",
+) -> list[dict[str, str]]:
+    return [{"claim": claim, "source": source, "verification": verification}]
+
+
 async def pursuit_text_and_idle(
     bot: MatrixOpenCodeBot, tmp_path: Path, session_id: str, text: str
 ) -> None:
@@ -197,6 +212,7 @@ async def test_diagnose_writes_redacted_local_report(tmp_path: Path) -> None:
     assert "never-share-this" not in report
     assert "hunter2" not in report
     assert "[REDACTED]" in report
+    assert '"pursuit_context_input_tokens": 250000' in report
     assert report_path.stat().st_mode & 0o777 == 0o600
     opencode.messages.assert_awaited_once_with("ses_1", str(tmp_path), limit=100)
     assert str(report_path) in matrix.room_send.await_args.kwargs["content"]["body"]
@@ -245,11 +261,10 @@ async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> 
         "type": "verdict",
         "verdict": "complete",
         "criteria": [{
-            "criterion": "The root cause is demonstrated with evidence",
+            "id": "c1",
             "status": "pass",
-            "evidence": "Independent inspection confirms parser X",
+            "evidence": evidence("Independent inspection confirms parser X"),
         }],
-        "evidence": ["Independent inspection confirms parser X"],
         "feedback": "",
         "gap": "",
         "question": None,
@@ -258,6 +273,126 @@ async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> 
     opencode.delete_session.assert_awaited_once_with("ses_verify", str(tmp_path))
     final = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
     assert "Pursuit complete" in final
+
+
+async def test_criterion_text_punctuation_is_not_part_of_verdict_protocol(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_worker",
+        str(tmp_path),
+        pursuit_goal="Find good jobs",
+        pursuit_phase="verifying",
+        pursuit_iteration=1,
+        verifier_session_id="ses_verify",
+        acceptance_criteria=criteria('Jobs qualify as "good" using the frozen rubric'),
+        in_flight_event_id="$verify",
+    )
+    store.rooms["!one:example"] = state
+
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "verdict",
+        "verdict": "complete",
+        "criteria": [{"id": "c1", "status": "pass", "evidence": evidence()}],
+        "feedback": "",
+        "gap": "",
+        "question": None,
+    })
+
+    assert state.pursuit_goal is None
+    opencode.delete_session.assert_awaited_once_with("ses_verify", str(tmp_path))
+
+
+async def test_mismatched_verdict_ids_are_repaired_without_persisting_evidence(
+    tmp_path: Path,
+) -> None:
+    bot, _, _, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_worker",
+        str(tmp_path),
+        pursuit_goal="Verify two facts",
+        pursuit_phase="verifying",
+        verifier_session_id="ses_verify",
+        acceptance_criteria=criteria("First fact", "Second fact"),
+        in_flight_event_id="$verify",
+    )
+    store.rooms["!one:example"] = state
+
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "verdict",
+        "verdict": "complete",
+        "criteria": [
+            {"id": "c1", "status": "pass", "evidence": evidence("one")},
+            {"id": "c1", "status": "pass", "evidence": evidence("duplicate")},
+        ],
+        "feedback": "",
+        "gap": "",
+        "question": None,
+    })
+
+    assert state.pursuit_protocol_failures == 1
+    assert state.pursuit_evidence == []
+    assert state.pursuit_criteria_status == {}
+
+
+def test_verdict_requires_structured_evidence_for_a_pass() -> None:
+    base = {
+        "type": "verdict",
+        "verdict": "complete",
+        "feedback": "",
+        "gap": "",
+        "question": None,
+    }
+    without_evidence = {
+        **base,
+        "criteria": [{"id": "c1", "status": "pass", "evidence": []}],
+    }
+    assert _parse_pursuit_control(json.dumps(without_evidence), "verifying") is None
+
+    for source in ("https://example.test/record", "/work/result.json", "pytest -q"):
+        payload = {
+            **base,
+            "criteria": [{
+                "id": "c1",
+                "status": "pass",
+                "evidence": evidence(source=source),
+            }],
+        }
+        assert _parse_pursuit_control(json.dumps(payload), "verifying") is not None
+
+
+async def test_continue_persists_valid_partial_evidence_by_criterion(
+    tmp_path: Path,
+) -> None:
+    bot, _, _, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_worker",
+        str(tmp_path),
+        pursuit_goal="Verify two facts",
+        pursuit_phase="verifying",
+        verifier_session_id="ses_verify",
+        acceptance_criteria=criteria("First fact", "Second fact"),
+        in_flight_event_id="$verify",
+    )
+    store.rooms["!one:example"] = state
+
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "verdict",
+        "verdict": "continue",
+        "criteria": [
+            {"id": "c1", "status": "pass", "evidence": evidence("First confirmed")},
+            {"id": "c2", "status": "unknown", "evidence": []},
+        ],
+        "feedback": "Find the second primary source.",
+        "gap": "Second fact remains unknown",
+        "question": None,
+    })
+
+    assert state.pursuit_phase == "working"
+    assert state.pursuit_criteria_status == {"c1": "pass", "c2": "unknown"}
+    assert state.pursuit_evidence[0]["criterion_id"] == "c1"
+    assert "First confirmed" in MatrixOpenCodeBot._worker_prompt(state)
 
 
 async def test_stop_clears_pursuit_before_aborting(tmp_path: Path) -> None:
@@ -290,7 +425,7 @@ async def test_persisted_idle_pursuit_resumes(tmp_path: Path) -> None:
         pursuit_goal="Keep investigating",
         pursuit_phase="working",
         pursuit_iteration=2,
-        acceptance_criteria=["Find reliable evidence"],
+        acceptance_criteria=criteria("Find reliable evidence"),
     )
     store.rooms["!one:example"] = state
 
@@ -299,6 +434,51 @@ async def test_persisted_idle_pursuit_resumes(tmp_path: Path) -> None:
     assert state.pursuit_iteration == 3
     assert state.in_flight_event_id is not None
     assert "Keep investigating" in opencode.prompt_async.await_args.args[2]
+    assert opencode.prompt_async.await_args.kwargs["tools"]["task"] is False
+
+
+async def test_legacy_active_pursuit_restarts_with_only_user_clarifications(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_old_worker",
+        str(tmp_path),
+        pursuit_goal="Research carefully",
+        pursuit_phase="verifying",
+        pursuit_protocol_version=1,
+        verifier_session_id="ses_old_verifier",
+        acceptance_criteria=criteria("Old criterion"),
+        pursuit_assumptions=[
+            "Assume the market is global",
+            "User clarification: Only Norway",
+        ],
+        pursuit_evidence=[{
+            "criterion_id": "c1",
+            "claim": "Old claim",
+            "source": "https://example.test/old",
+            "verification": "Old verifier said so",
+        }],
+        in_flight_event_id="$legacy",
+    )
+    store.rooms["!one:example"] = state
+    opencode.create_session.side_effect = [
+        {"id": "ses_new_worker", "title": "New worker"},
+        {"id": "ses_new_verifier", "title": "New verifier"},
+    ]
+
+    await bot.validate_restored_state()
+
+    opencode.abort.assert_awaited_once_with("ses_old_verifier", str(tmp_path))
+    opencode.delete_session.assert_not_awaited()
+    assert state.session_id == "ses_new_worker"
+    assert state.verifier_session_id == "ses_new_verifier"
+    assert state.pursuit_protocol_version == 2
+    assert state.pursuit_phase == "specifying"
+    assert state.pursuit_iteration == 0
+    assert state.pursuit_assumptions == ["User clarification: Only Norway"]
+    assert state.acceptance_criteria == []
+    assert state.pursuit_evidence == []
 
 
 async def test_pursuit_pauses_for_material_input_and_normal_reply_resumes(
@@ -337,7 +517,7 @@ async def test_verifier_continue_records_feedback_and_replans(tmp_path: Path) ->
         pursuit_phase="verifying",
         pursuit_iteration=1,
         verifier_session_id="ses_verify",
-        acceptance_criteria=["The claim is supported by a current primary source"],
+        acceptance_criteria=criteria("The claim is supported by a current primary source"),
         pursuit_last_worker_report="A blog repeats the claim.",
         in_flight_event_id="$verify",
     )
@@ -347,11 +527,10 @@ async def test_verifier_continue_records_feedback_and_replans(tmp_path: Path) ->
         "type": "verdict",
         "verdict": "continue",
         "criteria": [{
-            "criterion": "The claim is supported by a current primary source",
+            "id": "c1",
             "status": "unknown",
-            "evidence": "Only a secondary blog was found",
+            "evidence": [],
         }],
-        "evidence": [],
         "feedback": "Search the issuing authority's records and check contrary sources.",
         "gap": "No primary source",
         "question": None,
@@ -412,9 +591,9 @@ async def test_bare_verifier_json_is_accepted_when_it_is_the_entire_response(
     state = store.rooms["!one:example"]
     assert state.pursuit_phase == "working"
     assert state.pursuit_protocol_failures == 0
-    assert state.acceptance_criteria == [
+    assert state.acceptance_criteria == criteria(
         "Every listed role is currently open and located in Oslo"
-    ]
+    )
     assert opencode.prompt_async.await_args.args[0] == "ses_pursue"
 
 
@@ -517,7 +696,7 @@ async def test_verifier_prompt_text_is_not_combined_with_assistant_contract(
     state = store.rooms["!one:example"]
     assert state.pursuit_phase == "working"
     assert state.pursuit_protocol_failures == 0
-    assert state.acceptance_criteria == contract["criteria"]
+    assert state.acceptance_criteria == criteria(*contract["criteria"])
 
 
 async def test_placeholder_acceptance_contract_is_rejected(tmp_path: Path) -> None:
@@ -556,7 +735,7 @@ async def test_three_identical_evidence_free_gaps_reset_worker_context(
         pursuit_phase="verifying",
         pursuit_iteration=1,
         verifier_session_id="ses_verify",
-        acceptance_criteria=["Locate the authoritative record"],
+        acceptance_criteria=criteria("Locate the authoritative record"),
         pursuit_last_worker_report="No result",
         in_flight_event_id="$verify",
     )
@@ -566,11 +745,10 @@ async def test_three_identical_evidence_free_gaps_reset_worker_context(
         "type": "verdict",
         "verdict": "continue",
         "criteria": [{
-            "criterion": "Locate the authoritative record",
+            "id": "c1",
             "status": "unknown",
-            "evidence": "No authoritative record located",
+            "evidence": [],
         }],
-        "evidence": [],
         "feedback": "Change search vocabulary and database.",
         "gap": "Authoritative record not located",
         "question": None,
@@ -583,7 +761,95 @@ async def test_three_identical_evidence_free_gaps_reset_worker_context(
 
     assert state.session_id == "ses_reset"
     assert state.pursuit_stagnation_count == 0
-    assert "fresh strategy context" in opencode.prompt_async.await_args.args[2]
+    assert "fresh context after stagnation or context rotation" in (
+        opencode.prompt_async.await_args.args[2]
+    )
+
+
+async def test_worker_context_rotates_after_configured_input_threshold(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_large",
+        str(tmp_path),
+        pursuit_goal="Find the record",
+        pursuit_phase="working",
+        pursuit_iteration=1,
+        verifier_session_id="ses_verify",
+        acceptance_criteria=criteria("Locate the record"),
+        in_flight_event_id="$work",
+    )
+    store.rooms["!one:example"] = state
+    opencode.get_session.return_value = {
+        "id": "ses_large",
+        "tokens": {"input": bot.settings.pursuit_context_input_tokens},
+    }
+    opencode.create_session.return_value = {
+        "id": "ses_rotated",
+        "title": "Rotated",
+    }
+
+    await pursuit_text_and_idle(bot, tmp_path, "ses_large", "Worker report")
+    assert state.pursuit_worker_input_tokens == bot.settings.pursuit_context_input_tokens
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "verdict",
+        "verdict": "continue",
+        "criteria": [{"id": "c1", "status": "unknown", "evidence": []}],
+        "feedback": "Try another source.",
+        "gap": "Record not found",
+        "question": None,
+    })
+
+    assert state.session_id == "ses_rotated"
+    assert state.pursuit_worker_input_tokens == 0
+    assert "input-token threshold" in state.pursuit_reflections[-1]
+    assert opencode.create_session.await_count == 1
+
+
+async def test_context_and_stagnation_thresholds_cause_one_rotation(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_large",
+        str(tmp_path),
+        pursuit_goal="Find the record",
+        pursuit_phase="verifying",
+        pursuit_iteration=3,
+        verifier_session_id="ses_verify",
+        acceptance_criteria=criteria("Locate the record"),
+        pursuit_worker_input_tokens=bot.settings.pursuit_context_input_tokens,
+        pursuit_stagnation_count=2,
+        pursuit_signature="c1|Record not found",
+        in_flight_event_id="$verify",
+    )
+    store.rooms["!one:example"] = state
+    opencode.create_session.return_value = {"id": "ses_rotated", "title": "Rotated"}
+
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "verdict",
+        "verdict": "continue",
+        "criteria": [{"id": "c1", "status": "unknown", "evidence": []}],
+        "feedback": "Try another source.",
+        "gap": "Record not found",
+        "question": None,
+    })
+
+    assert state.session_id == "ses_rotated"
+    assert opencode.create_session.await_count == 1
+
+
+async def test_worker_token_metadata_failure_keeps_current_context(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, _ = make_bot(tmp_path)
+    state = RoomSession("ses_worker", str(tmp_path), pursuit_worker_input_tokens=123)
+    opencode.get_session.side_effect = OpenCodeError("metadata unavailable")
+
+    await bot._capture_worker_input_tokens(state)
+
+    assert state.pursuit_worker_input_tokens == 123
 
 
 async def test_status_reports_pursuit_progress_and_pending_question(tmp_path: Path) -> None:
@@ -594,9 +860,14 @@ async def test_status_reports_pursuit_progress_and_pending_question(tmp_path: Pa
         pursuit_goal="Answer a question",
         pursuit_phase="waiting_input",
         pursuit_iteration=2,
-        acceptance_criteria=["A", "B"],
-        pursuit_criteria_status={"A": "pass", "B": "unknown"},
-        pursuit_evidence=["Primary source confirms A"],
+        acceptance_criteria=criteria("A", "B"),
+        pursuit_criteria_status={"c1": "pass", "c2": "unknown"},
+        pursuit_evidence=[{
+            "criterion_id": "c1",
+            "claim": "Primary source confirms A",
+            "source": "https://example.test/a",
+            "verification": "Fetched and checked the primary source",
+        }],
         pursuit_gap="B remains unknown",
         pursuit_pending_question="Which date range?",
         bump_confirmation_session_id="ses_1",
@@ -606,6 +877,7 @@ async def test_status_reports_pursuit_progress_and_pending_question(tmp_path: Pa
     body = matrix.room_send.await_args.kwargs["content"]["body"]
     assert "Pursuit: waiting_input, pass 2" in body
     assert "Acceptance: 1/2" in body
+    assert "0/250,000 input tokens" in body
     assert "Which date range?" in body
     assert "awaiting !bump confirm" in body
 
@@ -662,6 +934,17 @@ async def test_busy_prompt_is_rejected(tmp_path: Path) -> None:
     await bot.on_message(room(), message(bot, "Another prompt"))
     opencode.prompt_async.assert_not_awaited()
     assert "busy" in matrix.room_send.await_args.kwargs["content"]["body"]
+
+
+async def test_ordinary_prompt_does_not_override_tool_availability(tmp_path: Path) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+
+    await bot.prompt("!one:example", "Inspect the project")
+
+    opencode.prompt_async.assert_awaited_once_with(
+        "ses_1", str(tmp_path), "Inspect the project"
+    )
 
 
 async def test_text_event_and_idle_finalize_with_matrix_edit(tmp_path: Path) -> None:
@@ -1039,7 +1322,7 @@ async def test_bump_reports_inactivity_then_confirm_resumes_same_pursuit_phase(
         pursuit_goal="Finish the research",
         pursuit_phase="working",
         pursuit_iteration=1,
-        acceptance_criteria=["Answer every material question with evidence"],
+        acceptance_criteria=criteria("Answer every material question with evidence"),
     )
     state.last_activity_ms = 100_000
     store.rooms["!one:example"] = state
@@ -1158,7 +1441,7 @@ async def test_pursuit_stalled_tool_is_quarantined_and_resumed_in_fresh_worker(
         pursuit_goal="Finish reliable research",
         pursuit_phase="working",
         pursuit_iteration=1,
-        acceptance_criteria=["Every claim has verified evidence"],
+        acceptance_criteria=criteria("Every claim has verified evidence"),
         active_tools={"part": {"name": "bash", "started_ms": 879_000}},
     )
     store.rooms["!one:example"] = state
@@ -1205,7 +1488,7 @@ async def test_pursuit_stalled_verifier_is_recreated_immediately(
         pursuit_phase="verifying",
         pursuit_iteration=2,
         verifier_session_id="ses_verifier_poisoned",
-        acceptance_criteria=["The answer is evidenced"],
+        acceptance_criteria=criteria("The answer is evidenced"),
         active_tools={"part": {"name": "webfetch", "started_ms": 879_000}},
     )
     store.rooms["!one:example"] = state
@@ -1430,7 +1713,7 @@ async def test_restart_quarantines_persisted_placeholder_contract(
         pursuit_phase="working",
         pursuit_iteration=2,
         verifier_session_id="ses_bad_verifier",
-        acceptance_criteria=["specific mandatory criterion"],
+        acceptance_criteria=criteria("specific mandatory criterion"),
         pursuit_assumptions=["assumption"],
     )
     store.rooms["!one:example"] = state

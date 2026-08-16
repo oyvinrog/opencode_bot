@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 
+PURSUIT_PROTOCOL_VERSION = 2
+
+
 @dataclass
 class PendingPermission:
     id: str
@@ -32,12 +35,14 @@ class RoomSession:
     pursuit_goal: str | None = None
     pursuit_phase: str | None = None
     pursuit_iteration: int = 0
+    pursuit_protocol_version: int = PURSUIT_PROTOCOL_VERSION
+    pursuit_worker_input_tokens: int = 0
     verifier_session_id: str | None = None
-    acceptance_criteria: list[str] = field(default_factory=list)
+    acceptance_criteria: list[dict[str, str]] = field(default_factory=list)
     pursuit_criteria_status: dict[str, str] = field(default_factory=dict)
     pursuit_assumptions: list[str] = field(default_factory=list)
     pursuit_reflections: list[str] = field(default_factory=list)
-    pursuit_evidence: list[str] = field(default_factory=list)
+    pursuit_evidence: list[dict[str, str]] = field(default_factory=list)
     pursuit_gap: str | None = None
     pursuit_stagnation_count: int = 0
     pursuit_signature: str | None = None
@@ -78,6 +83,8 @@ class RoomSession:
             "pursuit_goal": self.pursuit_goal,
             "pursuit_phase": self.pursuit_phase,
             "pursuit_iteration": self.pursuit_iteration,
+            "pursuit_protocol_version": self.pursuit_protocol_version,
+            "pursuit_worker_input_tokens": self.pursuit_worker_input_tokens,
             "verifier_session_id": self.verifier_session_id,
             "acceptance_criteria": self.acceptance_criteria,
             "pursuit_criteria_status": self.pursuit_criteria_status,
@@ -128,12 +135,19 @@ class RoomSession:
             pursuit_iteration=int(
                 value.get("pursuit_iteration") or value.get("obsess_iteration") or 0
             ),
+            pursuit_protocol_version=int(
+                value.get("pursuit_protocol_version")
+                or (1 if pursuit_goal else PURSUIT_PROTOCOL_VERSION)
+            ),
+            pursuit_worker_input_tokens=int(
+                value.get("pursuit_worker_input_tokens") or 0
+            ),
             verifier_session_id=(
                 str(value["verifier_session_id"])
                 if value.get("verifier_session_id")
                 else None
             ),
-            acceptance_criteria=_string_list(value.get("acceptance_criteria")),
+            acceptance_criteria=_criteria(value.get("acceptance_criteria")),
             pursuit_criteria_status={
                 str(key): str(status)
                 for key, status in (value.get("pursuit_criteria_status") or {}).items()
@@ -143,7 +157,7 @@ class RoomSession:
             else {},
             pursuit_assumptions=_string_list(value.get("pursuit_assumptions")),
             pursuit_reflections=_string_list(value.get("pursuit_reflections")),
-            pursuit_evidence=_string_list(value.get("pursuit_evidence")),
+            pursuit_evidence=_evidence(value.get("pursuit_evidence")),
             pursuit_gap=str(value["pursuit_gap"]) if value.get("pursuit_gap") else None,
             pursuit_stagnation_count=int(value.get("pursuit_stagnation_count") or 0),
             pursuit_signature=(
@@ -216,7 +230,7 @@ class StateStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.parent.chmod(stat.S_IRWXU)
             temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            payload = {"version": 2, "rooms": {k: v.to_dict() for k, v in self.rooms.items()}}
+            payload = {"version": 3, "rooms": {k: v.to_dict() for k, v in self.rooms.items()}}
             temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
             os.replace(temporary, self.path)
@@ -235,6 +249,41 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if str(item).strip()]
+
+
+def _criteria(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        criterion_id = item.get("id")
+        text = item.get("text")
+        if (
+            isinstance(criterion_id, str)
+            and criterion_id.strip()
+            and isinstance(text, str)
+            and text.strip()
+        ):
+            result.append({"id": criterion_id.strip(), "text": text.strip()})
+    return result
+
+
+def _evidence(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        fields = {
+            key: item.get(key)
+            for key in ("criterion_id", "claim", "source", "verification")
+        }
+        if all(isinstance(field, str) and field.strip() for field in fields.values()):
+            result.append({key: str(field).strip() for key, field in fields.items()})
+    return result
 
 
 def _active_tools(value: Any) -> dict[str, dict[str, Any]]:

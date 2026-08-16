@@ -116,18 +116,32 @@ still contain private data. Inspect `DIAGNOSIS.txt` before copying or sharing it
 Starting a session posts a compact reminder of the available commands. `!pursue`
 starts a fresh worker when the room already has a session, preventing a large or
 poisoned ordinary-chat transcript from contaminating the pursuit. It also creates
-a separate verifier session that freezes task-aware acceptance criteria. Literal
-schema placeholders and duplicate criteria are rejected instead of becoming the
-contract. The worker then acts in repeated passes while the verifier independently
-checks evidence after every pass. The pursuit completes automatically only when
-all mandatory criteria pass. Material ambiguities pause for an ordinary Matrix
-reply; difficulty or lack of immediate progress does not stop the loop.
+a separate verifier session that freezes task-aware acceptance criteria. The bot
+assigns stable IDs to those criteria, so completion does not depend on the model
+repeating punctuation exactly. Literal schema placeholders and duplicate criteria
+are rejected instead of becoming the contract. The worker then acts in repeated
+passes while the verifier independently checks evidence after every pass. Passing
+evidence records a claim, its direct source URL/file/check, and how the verifier
+checked it. The pursuit completes automatically only when all mandatory criteria
+pass. Material ambiguities pause for an ordinary Matrix reply; difficulty or lack
+of immediate progress does not stop the loop.
 
-Pursuits survive bot restarts and have no pass or token limit. Verifier feedback,
-accepted evidence, failed approaches, and unresolved gaps are persisted. Three
-passes with the same gap and no new evidence trigger a fresh worker context with
-that durable memory. `!stop` clears the pursuit, aborts its active worker or
-verifier turn, and removes the temporary verifier session.
+Pursuits survive bot restarts and have no overall pass or token limit. Verifier
+feedback, structured evidence, failed approaches, and unresolved gaps are
+persisted by criterion ID. A verdict is fully validated before any of its status or
+evidence is stored. Three passes with the same gap and no new evidence trigger a
+fresh worker context with that durable memory. The next pass also rotates to a
+fresh worker when cumulative input reaches
+`OPENCODE_PURSUE_CONTEXT_INPUT_TOKENS` (250,000 by default). Pursuit workers use
+direct, observable tools; delegated `task` calls are disabled. `!stop` clears the
+pursuit, aborts its active worker or verifier turn, and removes the temporary
+verifier session.
+
+When upgrading an active pursuit from the older free-form evidence protocol, the
+bot retains its goal and explicit `User clarification:` entries, creates fresh
+worker and verifier sessions, and regenerates the contract. Old OpenCode sessions
+remain available for audit, while old criteria and unverified evidence are not
+carried forward.
 
 Verification adapts to the task: code work favors executable checks, web research
 checks source authority, identity, recency, claim coverage, and contradictions,

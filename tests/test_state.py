@@ -20,10 +20,16 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
             pursuit_goal="Investigate thoroughly",
             pursuit_phase="verifying",
             pursuit_iteration=7,
+            pursuit_worker_input_tokens=42_000,
             verifier_session_id="ses_verify",
-            acceptance_criteria=["Answer is source-grounded"],
-            pursuit_criteria_status={"Answer is source-grounded": "unknown"},
-            pursuit_evidence=["Primary record found"],
+            acceptance_criteria=[{"id": "c1", "text": "Answer is source-grounded"}],
+            pursuit_criteria_status={"c1": "unknown"},
+            pursuit_evidence=[{
+                "criterion_id": "c1",
+                "claim": "Primary record found",
+                "source": "https://example.test/record",
+                "verification": "Fetched and inspected the record",
+            }],
             bump_confirmation_session_id="ses_1",
             bump_confirmation_activity_ms=122,
             manual_bump_pending=True,
@@ -43,7 +49,9 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
     assert restored.rooms["!room:example"].pursuit_goal == "Investigate thoroughly"
     assert restored.rooms["!room:example"].pursuit_iteration == 7
     assert restored.rooms["!room:example"].verifier_session_id == "ses_verify"
-    assert restored.rooms["!room:example"].pursuit_evidence == ["Primary record found"]
+    assert restored.rooms["!room:example"].pursuit_evidence[0]["claim"] == "Primary record found"
+    assert restored.rooms["!room:example"].pursuit_worker_input_tokens == 42_000
+    assert json.loads(path.read_text())["version"] == 3
     assert restored.rooms["!room:example"].bump_confirmation_session_id == "ses_1"
     assert restored.rooms["!room:example"].manual_bump_pending is True
     assert restored.rooms["!room:example"].manual_bump_attempts == 2

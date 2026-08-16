@@ -33,7 +33,7 @@ from nio.exceptions import OlmUnverifiedDeviceError
 
 from .config import Settings
 from .opencode import OpenCodeClient, OpenCodeError
-from .state import PendingPermission, RoomSession, StateStore
+from .state import PURSUIT_PROTOCOL_VERSION, PendingPermission, RoomSession, StateStore
 
 LOG = logging.getLogger("matrix_opencode")
 MAX_MESSAGE_CHARS = 20_000
@@ -62,6 +62,7 @@ inspect state and run applicable checks. For qualitative work, use the frozen ru
 facts from inference. Difficulty is not a reason to stop. Return exactly one tagged JSON control
 envelope in the requested schema and no text outside it."""
 VERIFIER_TOOLS = {"write": False, "edit": False, "apply_patch": False, "task": False}
+PURSUIT_WORKER_TOOLS = {"task": False}
 
 HELP = """Matrix–OpenCode commands:
 !new [directory] — start a session
@@ -430,12 +431,19 @@ Normally provide 2-6 non-overlapping criteria. Do not perform the task yet."""
 
     @staticmethod
     def _worker_prompt(state: RoomSession, *, reset: bool = False) -> str:
-        criteria = "\n".join(f"- {item}" for item in state.acceptance_criteria)
+        criteria = "\n".join(
+            f"- [{item['id']}] {item['text']}" for item in state.acceptance_criteria
+        )
         assumptions = "\n".join(f"- {item}" for item in state.pursuit_assumptions) or "- None"
         reflections = "\n".join(f"- {item}" for item in state.pursuit_reflections[-6:]) or "- None"
-        evidence = "\n".join(f"- {item}" for item in state.pursuit_evidence[-8:]) or "- None"
+        evidence = "\n".join(
+            f"- [{item['criterion_id']}] {item['claim']} (source: {item['source']}; "
+            f"verified: {item['verification']})"
+            for item in state.pursuit_evidence[-8:]
+        ) or "- None"
         reset_text = (
-            "This is a fresh strategy context after stagnation. Do not repeat failed approaches."
+            "This is a fresh context after stagnation or context rotation. Preserve the durable "
+            "evidence above and do not repeat failed approaches."
             if reset
             else "Continue from the existing session state."
         )
@@ -463,13 +471,30 @@ goal complete; the separate verifier decides that. End with a concise report con
 new evidence, unresolved gaps, and failures. For research, include direct source URLs and separate
 sourced facts from inference. Keep tool calls small, bounded, and independently checkable. Never
 combine web research, parsing, and deliverable creation in one giant shell or Python command. Give
-shell and network operations explicit timeouts, and prefer dedicated search/fetch/write tools."""
+shell and network operations explicit timeouts, and prefer dedicated search/fetch/write tools.
+Delegated task or subagent calls are disabled for pursuit workers; perform each step directly."""
+
+    async def _submit_worker(
+        self, room_id: str, state: RoomSession, *, reset: bool = False
+    ) -> bool:
+        return await self._submit_prompt(
+            room_id,
+            state,
+            self._worker_prompt(state, reset=reset),
+            tools=PURSUIT_WORKER_TOOLS,
+        )
 
     @staticmethod
     def _verification_prompt(state: RoomSession) -> str:
-        criteria = "\n".join(f"- {item}" for item in state.acceptance_criteria)
+        criteria = "\n".join(
+            f"- [{item['id']}] {item['text']}" for item in state.acceptance_criteria
+        )
         assumptions = "\n".join(f"- {item}" for item in state.pursuit_assumptions) or "- None"
-        prior_evidence = "\n".join(f"- {item}" for item in state.pursuit_evidence[-12:]) or "- None"
+        prior_evidence = "\n".join(
+            f"- [{item['criterion_id']}] {item['claim']} (source: {item['source']}; "
+            f"verified: {item['verification']})"
+            for item in state.pursuit_evidence[-12:]
+        ) or "- None"
         prior_feedback = "\n".join(f"- {item}" for item in state.pursuit_reflections[-6:]) or "- None"
         return f"""Independently evaluate the latest worker pass against the frozen contract.
 
@@ -491,11 +516,14 @@ Worker report (claims are not evidence until independently checked):
 {state.pursuit_last_worker_report or "No report was recovered."}
 
 Use available read-only tools and external sources to check material claims. `complete` is valid only
-when every mandatory criterion passes with concrete evidence. Repeat each frozen criterion's text
-exactly in the criteria array. Use `needs_input` only for a material
+when every mandatory criterion passes with concrete, independently checked evidence. Return each
+criterion ID exactly once; never repeat or rewrite criterion text. Every `pass` needs at least one
+evidence record with a specific claim, a direct source URL/file/check, and what you independently
+did to verify it. A search suggestion, generic contact title, guessed address, or market benchmark
+that does not prove the criterion is not passing evidence. Use `needs_input` only for a material
 user fact or action; difficulty means `continue`.
 Return exactly:
-<pursuit-control>{{"type":"verdict","verdict":"complete|continue|needs_input","criteria":[{{"criterion":"...","status":"pass|fail|unknown","evidence":"..."}}],"evidence":["new verified evidence"],"feedback":"specific next strategy","gap":"most important unresolved gap or empty","question":null}}</pursuit-control>"""
+<pursuit-control>{{"type":"verdict","verdict":"complete|continue|needs_input","criteria":[{{"id":"c1","status":"pass|fail|unknown","evidence":[{{"claim":"specific fact","source":"direct URL, file path, or executed check","verification":"how it was independently checked"}}]}}],"feedback":"specific next strategy","gap":"most important unresolved gap or empty","question":null}}</pursuit-control>"""
 
     async def _resume_pursuit_with_input(
         self, room_id: str, state: RoomSession, text: str
@@ -507,7 +535,7 @@ Return exactly:
             state.pursuit_phase = "working"
             state.pursuit_iteration += 1
             await self.store.save()
-            await self._submit_prompt(room_id, state, self._worker_prompt(state))
+            await self._submit_worker(room_id, state)
         else:
             state.pursuit_phase = "specifying"
             await self.store.save()
@@ -519,6 +547,7 @@ Return exactly:
         phase = state.pursuit_phase
         if phase == "working":
             state.pursuit_last_worker_report = raw[-16_000:]
+            await self._capture_worker_input_tokens(state)
             await self.finalize(room_id, state, raw)
             if not state.acceptance_criteria:
                 state.pursuit_phase = "specifying"
@@ -537,7 +566,10 @@ Return exactly:
         state.pursuit_protocol_failures = 0
 
         if phase == "specifying":
-            state.acceptance_criteria = control["criteria"]
+            state.acceptance_criteria = [
+                {"id": f"c{index}", "text": text}
+                for index, text in enumerate(control["criteria"], start=1)
+            ]
             state.pursuit_assumptions.extend(control["assumptions"])
             state.pursuit_assumptions = state.pursuit_assumptions[-12:]
             if control["needs_input"]:
@@ -549,44 +581,65 @@ Return exactly:
             state.pursuit_phase = "working"
             state.pursuit_iteration = max(1, state.pursuit_iteration + 1)
             summary = "Acceptance contract:\n" + "\n".join(
-                f"- {item}" for item in state.acceptance_criteria
+                f"- [{item['id']}] {item['text']}" for item in state.acceptance_criteria
             )
             await self.finalize(room_id, state, summary)
-            await self._submit_prompt(room_id, state, self._worker_prompt(state))
+            await self._submit_worker(room_id, state)
             return
 
         verdict = control["verdict"]
-        new_evidence = control["evidence"] + [
-            item["evidence"]
-            for item in control["criteria"]
-            if item["status"] == "pass" and item["evidence"]
+        expected_ids = [item["id"] for item in state.acceptance_criteria]
+        returned_ids = [item["id"] for item in control["criteria"]]
+        if (
+            len(returned_ids) != len(set(returned_ids))
+            or set(returned_ids) != set(expected_ids)
+        ):
+            await self._repair_pursuit_protocol(room_id, state, raw)
+            return
+        by_id = {item["id"]: item for item in control["criteria"]}
+        ordered_criteria = [by_id[criterion_id] for criterion_id in expected_ids]
+        new_evidence = [
+            {"criterion_id": item["id"], **evidence}
+            for item in ordered_criteria
+            for evidence in item["evidence"]
         ]
-        new_evidence = list(dict.fromkeys(new_evidence))
         state.pursuit_criteria_status = {
-            item["criterion"]: item["status"] for item in control["criteria"]
+            item["id"]: item["status"] for item in ordered_criteria
         }
-        state.pursuit_evidence.extend(new_evidence)
+        known_evidence = {
+            (item["criterion_id"], item["claim"], item["source"], item["verification"])
+            for item in state.pursuit_evidence
+        }
+        for item in new_evidence:
+            key = (
+                item["criterion_id"],
+                item["claim"],
+                item["source"],
+                item["verification"],
+            )
+            if key not in known_evidence:
+                state.pursuit_evidence.append(item)
+                known_evidence.add(key)
         state.pursuit_evidence = state.pursuit_evidence[-16:]
         if verdict == "complete":
             passed = all(
                 item["status"] == "pass" and bool(item["evidence"])
-                for item in control["criteria"]
+                for item in ordered_criteria
             )
-            exact_contract = {
-                item["criterion"] for item in control["criteria"]
-            } == set(state.acceptance_criteria)
-            if not passed or not exact_contract:
+            if not passed:
                 verdict = "continue"
                 control["feedback"] = (
-                    "Completion rejected: repeat every frozen criterion exactly and provide "
-                    "passing evidence for each one."
+                    "Completion rejected: every frozen criterion ID must have passing, "
+                    "structured evidence."
                 )
 
         if verdict == "complete":
-            completion_evidence = new_evidence or [
-                item["evidence"] for item in control["criteria"] if item["evidence"]
-            ]
-            evidence_text = "\n".join(f"- {item}" for item in completion_evidence)
+            completion_evidence = new_evidence or state.pursuit_evidence
+            evidence_text = "\n".join(
+                f"- [{item['criterion_id']}] {item['claim']} — {item['source']} "
+                f"({item['verification']})"
+                for item in completion_evidence
+            )
             final = f"✅ Pursuit complete after {state.pursuit_iteration} pass(es).\nEvidence:\n{evidence_text}"
             await self.finalize(room_id, state, final)
             await self._finish_pursuit(state)
@@ -605,7 +658,7 @@ Return exactly:
         state.pursuit_reflections = state.pursuit_reflections[-10:]
         state.pursuit_gap = control["gap"] or "Unmet acceptance criteria remain."
         signature = "|".join(
-            sorted(item["criterion"] for item in control["criteria"] if item["status"] != "pass")
+            sorted(item["id"] for item in ordered_criteria if item["status"] != "pass")
         ) + "|" + state.pursuit_gap
         if new_evidence:
             state.pursuit_signature = signature
@@ -615,7 +668,12 @@ Return exactly:
         else:
             state.pursuit_signature = signature
             state.pursuit_stagnation_count = 1
-        reset = state.pursuit_stagnation_count >= 3
+        reset_for_stagnation = state.pursuit_stagnation_count >= 3
+        reset_for_context = (
+            state.pursuit_worker_input_tokens
+            >= self.settings.pursuit_context_input_tokens
+        )
+        reset = reset_for_stagnation or reset_for_context
         await self.finalize(
             room_id,
             state,
@@ -623,16 +681,39 @@ Return exactly:
         )
         if reset:
             worker = await self.opencode.create_session(
-                state.directory, title="Matrix OpenCode pursuit (strategy reset)"
+                state.directory,
+                title=(
+                    "Matrix OpenCode pursuit (strategy reset)"
+                    if reset_for_stagnation
+                    else "Matrix OpenCode pursuit (context rotation)"
+                ),
             )
             state.session_id = str(worker["id"])
             state.title = str(worker.get("title") or state.title)
+            state.pursuit_worker_input_tokens = 0
             state.pursuit_stagnation_count = 0
             state.pursuit_signature = None
+            if reset_for_context:
+                state.pursuit_reflections.append(
+                    "Worker context was rotated after reaching the configured input-token threshold."
+                )
+                state.pursuit_reflections = state.pursuit_reflections[-10:]
         state.pursuit_phase = "working"
         state.pursuit_iteration += 1
         await self.store.save()
-        await self._submit_prompt(room_id, state, self._worker_prompt(state, reset=reset))
+        await self._submit_worker(room_id, state, reset=reset)
+
+    async def _capture_worker_input_tokens(self, state: RoomSession) -> None:
+        try:
+            session = await self.opencode.get_session(state.session_id, state.directory)
+        except OpenCodeError as exc:
+            LOG.warning("Could not read pursuit worker token usage for %s: %s", state.session_id, exc)
+            return
+        tokens = session.get("tokens")
+        if isinstance(tokens, dict):
+            state.pursuit_worker_input_tokens = max(
+                state.pursuit_worker_input_tokens, _integer(tokens.get("input"))
+            )
 
     async def _repair_pursuit_protocol(
         self, room_id: str, state: RoomSession, raw: str
@@ -684,6 +765,8 @@ Return exactly:
         state.pursuit_goal = None
         state.pursuit_phase = None
         state.pursuit_iteration = 0
+        state.pursuit_protocol_version = PURSUIT_PROTOCOL_VERSION
+        state.pursuit_worker_input_tokens = 0
         state.verifier_session_id = None
         state.acceptance_criteria.clear()
         state.pursuit_criteria_status.clear()
@@ -772,10 +855,19 @@ Return exactly:
                 f"Acceptance: {passed}/{len(state.acceptance_criteria)} evidenced; "
                 f"stagnation {state.pursuit_stagnation_count}/3"
             )
+            lines.append(
+                "Worker context: "
+                f"{state.pursuit_worker_input_tokens:,}/"
+                f"{self.settings.pursuit_context_input_tokens:,} input tokens"
+            )
             if state.pursuit_gap:
                 lines.append(f"Current gap: {state.pursuit_gap}")
             if state.pursuit_evidence:
-                lines.append(f"Latest evidence: {state.pursuit_evidence[-1]}")
+                latest = state.pursuit_evidence[-1]
+                lines.append(
+                    f"Latest evidence [{latest['criterion_id']}]: {latest['claim']} — "
+                    f"{latest['source']}"
+                )
             if state.pursuit_pending_question:
                 lines.append(f"Waiting for input: {state.pursuit_pending_question}")
             if state.pursuit_retry_attempts:
@@ -832,6 +924,7 @@ Return exactly:
                 "stuck_timeout_seconds": self.settings.stuck_timeout_seconds,
                 "pursuit_stuck_timeout_seconds": self.settings.pursuit_stuck_timeout_seconds,
                 "pursuit_tool_timeout_seconds": self.settings.pursuit_tool_timeout_seconds,
+                "pursuit_context_input_tokens": self.settings.pursuit_context_input_tokens,
                 "matrix_edit_interval_seconds": self.settings.matrix_edit_interval_seconds,
             },
             "room_id": room_id,
@@ -1807,6 +1900,12 @@ Return exactly:
                     continue
                 try:
                     self.settings.resolve_directory(state.directory)
+                    if (
+                        state.pursuit_goal
+                        and state.pursuit_protocol_version < PURSUIT_PROTOCOL_VERSION
+                    ):
+                        await self._restart_legacy_pursuit(room_id, state)
+                        changed = True
                     session = await self.opencode.get_session(
                         state.session_id, state.directory
                     )
@@ -1819,9 +1918,9 @@ Return exactly:
                         and state.acceptance_criteria
                         and (
                             len(state.acceptance_criteria)
-                            != len(set(state.acceptance_criteria))
+                            != len({item["id"] for item in state.acceptance_criteria})
                             or any(
-                                _is_placeholder_contract_text(item)
+                                _is_placeholder_contract_text(item["text"])
                                 for item in state.acceptance_criteria
                             )
                         )
@@ -1915,6 +2014,12 @@ Return exactly:
         """Restart persisted pursuit phases after the global event listener is running."""
         for room_id, state in list(self.store.rooms.items()):
             if (
+                state.pursuit_goal
+                and state.pursuit_protocol_version < PURSUIT_PROTOCOL_VERSION
+            ):
+                async with self.room_locks[room_id]:
+                    await self._restart_legacy_pursuit(room_id, state)
+            if (
                 not state.pursuit_goal
                 or state.in_flight_event_id
                 or state.pursuit_phase == "waiting_input"
@@ -1927,6 +2032,51 @@ Return exactly:
                     and (await self._status(state)).get("type") == "idle"
                 ):
                     await self._resume_pursuit_phase(room_id, state)
+
+    async def _restart_legacy_pursuit(self, room_id: str, state: RoomSession) -> None:
+        goal = state.pursuit_goal
+        if not goal:
+            return
+        clarifications = [
+            item
+            for item in state.pursuit_assumptions
+            if item.startswith("User clarification:")
+        ]
+        if state.in_flight_event_id:
+            with contextlib.suppress(OpenCodeError):
+                await self.opencode.abort(self._active_session_id(state), state.directory)
+            await self.finalize(
+                room_id,
+                state,
+                "Restarting this pursuit under the upgraded evidence protocol.",
+            )
+        worker = await self.opencode.create_session(
+            state.directory, title="Matrix OpenCode pursuit worker (protocol upgrade)"
+        )
+        verifier = await self.opencode.create_session(
+            state.directory, title="Matrix pursuit verifier (protocol upgrade)"
+        )
+        state.session_id = str(worker["id"])
+        state.title = str(worker.get("title") or state.title)
+        state.verifier_session_id = str(verifier["id"])
+        state.pursuit_goal = goal
+        state.pursuit_phase = "specifying"
+        state.pursuit_iteration = 0
+        state.pursuit_protocol_version = PURSUIT_PROTOCOL_VERSION
+        state.pursuit_worker_input_tokens = 0
+        state.acceptance_criteria.clear()
+        state.pursuit_criteria_status.clear()
+        state.pursuit_assumptions = clarifications
+        state.pursuit_reflections.clear()
+        state.pursuit_evidence.clear()
+        state.pursuit_gap = None
+        state.pursuit_stagnation_count = 0
+        state.pursuit_signature = None
+        state.pursuit_pending_question = None
+        state.pursuit_protocol_failures = 0
+        state.pursuit_retry_attempts = 0
+        state.pursuit_last_worker_report = None
+        await self.store.save()
 
     async def _resume_pursuit_phase(self, room_id: str, state: RoomSession) -> None:
         if state.pursuit_phase == "specifying":
@@ -1942,7 +2092,7 @@ Return exactly:
             else:
                 state.pursuit_iteration = max(1, state.pursuit_iteration + 1)
                 await self.store.save()
-                await self._submit_prompt(room_id, state, self._worker_prompt(state))
+                await self._submit_worker(room_id, state)
 
     async def send_text(self, room_id: str, body: str) -> str | None:
         try:
@@ -2107,7 +2257,6 @@ def _parse_pursuit_control(text: str, phase: str | None) -> dict[str, Any] | Non
         }
 
     criteria = value.get("criteria")
-    evidence = value.get("evidence")
     verdict = value.get("verdict")
     question = value.get("question")
     if (
@@ -2115,31 +2264,45 @@ def _parse_pursuit_control(text: str, phase: str | None) -> dict[str, Any] | Non
         or verdict not in {"complete", "continue", "needs_input"}
         or not isinstance(criteria, list)
         or not criteria
-        or not isinstance(evidence, list)
-        or not all(isinstance(item, str) for item in evidence)
         or (verdict == "needs_input" and (not isinstance(question, str) or not question.strip()))
+        or (verdict != "needs_input" and not (question is None or question == ""))
     ):
         return None
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     for item in criteria:
         if (
             not isinstance(item, dict)
-            or not isinstance(item.get("criterion"), str)
+            or not isinstance(item.get("id"), str)
+            or not item["id"].strip()
             or item.get("status") not in {"pass", "fail", "unknown"}
-            or not isinstance(item.get("evidence"), str)
+            or not isinstance(item.get("evidence"), list)
         ):
+            return None
+        normalized_evidence: list[dict[str, str]] = []
+        for evidence_item in item["evidence"]:
+            if not isinstance(evidence_item, dict):
+                return None
+            fields = {
+                key: evidence_item.get(key)
+                for key in ("claim", "source", "verification")
+            }
+            if not all(isinstance(field, str) and field.strip() for field in fields.values()):
+                return None
+            normalized_evidence.append(
+                {key: str(field).strip() for key, field in fields.items()}
+            )
+        if item["status"] == "pass" and not normalized_evidence:
             return None
         normalized.append(
             {
-                "criterion": item["criterion"].strip(),
+                "id": item["id"].strip(),
                 "status": item["status"],
-                "evidence": item["evidence"].strip(),
+                "evidence": normalized_evidence,
             }
         )
     return {
         "verdict": verdict,
         "criteria": normalized,
-        "evidence": [item.strip() for item in evidence if item.strip()],
         "feedback": str(value.get("feedback") or "").strip(),
         "gap": str(value.get("gap") or "").strip(),
         "question": question.strip() if isinstance(question, str) else None,
