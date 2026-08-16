@@ -3,7 +3,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from matrix_opencode_bot.bot import MatrixOpenCodeBot, render_diffs, split_text
+from matrix_opencode_bot.bot import (
+    MatrixOpenCodeBot,
+    _parse_pursuit_control,
+    render_diffs,
+    split_text,
+)
 from matrix_opencode_bot.config import Settings
 from matrix_opencode_bot.opencode import OpenCodeError
 from matrix_opencode_bot.state import PendingPermission, RoomSession, StateStore
@@ -411,6 +416,21 @@ async def test_bare_verifier_json_is_accepted_when_it_is_the_entire_response(
         "Every listed role is currently open and located in Oslo"
     ]
     assert opencode.prompt_async.await_args.args[0] == "ses_pursue"
+
+
+def test_alternate_whole_response_control_wrappers_are_accepted() -> None:
+    contract = {
+        "type": "contract",
+        "criteria": ["At least ten current Oslo jobs are supported by listing URLs"],
+        "assumptions": [],
+        "needs_input": False,
+        "question": None,
+    }
+    nested = json.dumps({"pursuit-control": contract})
+
+    assert _parse_pursuit_control(nested, "specifying") is not None
+    assert _parse_pursuit_control(f"```json\n{nested}\n```", "specifying") is not None
+    assert _parse_pursuit_control(f"Here is the result:\n{nested}", "specifying") is None
 
 
 async def test_verifier_prompt_text_is_not_combined_with_assistant_contract(

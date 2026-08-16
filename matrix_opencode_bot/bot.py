@@ -2041,10 +2041,14 @@ def _parse_pursuit_control(text: str, phase: str | None) -> dict[str, Any] | Non
     if len(matches) == 1:
         encoded = matches[0]
     elif not matches:
-        # Some otherwise compliant models omit only the XML-style wrapper. Accept a
-        # bare object when it is the entire response, while continuing to reject JSON
-        # embedded in prose or multiple control envelopes.
+        # Some otherwise compliant models omit the XML-style wrapper, use its name as
+        # a JSON object key, or wrap that object in one Markdown JSON fence. Normalize
+        # only when the variant occupies the entire response; embedded JSON and prose
+        # remain invalid.
         encoded = text.strip()
+        fence = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?```", encoded, re.DOTALL)
+        if fence:
+            encoded = fence.group(1).strip()
         if not (encoded.startswith("{") and encoded.endswith("}")):
             return None
     else:
@@ -2055,6 +2059,10 @@ def _parse_pursuit_control(text: str, phase: str | None) -> dict[str, Any] | Non
         return None
     if not isinstance(value, dict):
         return None
+    if set(value) == {"pursuit-control"}:
+        value = value["pursuit-control"]
+        if not isinstance(value, dict):
+            return None
 
     if phase == "specifying":
         criteria = value.get("criteria")
