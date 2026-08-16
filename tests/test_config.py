@@ -24,6 +24,8 @@ def test_settings_parse_required_values(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert settings.opencode_url == "http://127.0.0.1:4096"
     assert settings.show_reasoning is False
     assert settings.stuck_timeout_seconds == 900
+    assert settings.pursuit_stuck_timeout_seconds == 180
+    assert settings.pursuit_tool_timeout_seconds == 120
 
 
 def test_settings_can_enable_reasoning(
@@ -111,6 +113,24 @@ def test_stuck_timeout_must_be_positive(
         monkeypatch.setenv("OPENCODE_STUCK_TIMEOUT_SECONDS", invalid)
         with pytest.raises(ValueError, match="positive integer"):
             Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "name,attribute",
+    [
+        ("OPENCODE_PURSUE_STUCK_TIMEOUT_SECONDS", "pursuit_stuck_timeout_seconds"),
+        ("OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS", "pursuit_tool_timeout_seconds"),
+    ],
+)
+def test_pursuit_timeouts_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, attribute: str
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv(name, "42")
+    assert getattr(Settings.from_env(), attribute) == 42
+    monkeypatch.setenv(name, "0")
+    with pytest.raises(ValueError, match="positive integer"):
+        Settings.from_env()
 
 
 def test_positive_int_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:

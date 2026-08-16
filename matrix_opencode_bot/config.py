@@ -55,6 +55,8 @@ class Settings:
     allowed_roots: tuple[Path, ...]
     show_reasoning: bool = False
     stuck_timeout_seconds: int = 900
+    pursuit_stuck_timeout_seconds: int = 180
+    pursuit_tool_timeout_seconds: int = 120
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -107,6 +109,12 @@ class Settings:
             show_reasoning=env_bool("MATRIX_SHOW_REASONING", False),
             stuck_timeout_seconds=env_positive_int(
                 "OPENCODE_STUCK_TIMEOUT_SECONDS", 900
+            ),
+            pursuit_stuck_timeout_seconds=env_positive_int(
+                "OPENCODE_PURSUE_STUCK_TIMEOUT_SECONDS", 180
+            ),
+            pursuit_tool_timeout_seconds=env_positive_int(
+                "OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS", 120
             ),
         )
 

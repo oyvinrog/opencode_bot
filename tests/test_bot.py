@@ -158,6 +158,7 @@ async def test_new_session_includes_command_reminder(tmp_path: Path) -> None:
     assert "Commands:" in body
     assert "!new [directory]" in body
     assert "!pursue <goal>" in body
+    assert "!bump" in body
     assert "!obsess" not in body
 
 
@@ -387,12 +388,38 @@ async def test_status_reports_pursuit_progress_and_pending_question(tmp_path: Pa
         pursuit_evidence=["Primary source confirms A"],
         pursuit_gap="B remains unknown",
         pursuit_pending_question="Which date range?",
+        bump_confirmation_session_id="ses_1",
+        bump_confirmation_activity_ms=1,
     )
     await bot.command_status("!one:example")
     body = matrix.room_send.await_args.kwargs["content"]["body"]
     assert "Pursuit: waiting_input, pass 2" in body
     assert "Acceptance: 1/2" in body
     assert "Which date range?" in body
+    assert "awaiting !bump confirm" in body
+
+
+async def test_status_shows_pursuit_tool_recovery_countdown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.time", lambda: 1_000.0)
+    store.rooms["!one:example"] = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        in_flight_event_id="$work",
+        prompt_started_ms=900_000,
+        last_activity_ms=999_000,
+        pursuit_goal="Finish",
+        pursuit_phase="working",
+        active_tools={"part": {"name": "bash", "started_ms": 940_000}},
+    )
+    opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
+
+    await bot.command_status("!one:example")
+
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "Automatic recovery: tool bash in 1m 00s" in body
 
 
 async def test_pursuit_submission_error_retries_with_backoff(
@@ -451,9 +478,10 @@ async def test_text_event_and_idle_finalize_with_matrix_edit(tmp_path: Path) -> 
 
 async def test_tool_progress_is_reported_without_tool_arguments(tmp_path: Path) -> None:
     bot, matrix, _, store = make_bot(tmp_path)
-    store.rooms["!one:example"] = RoomSession(
+    state = RoomSession(
         "ses_1", str(tmp_path), in_flight_event_id="$progress", prompt_started_ms=1
     )
+    store.rooms["!one:example"] = state
     await bot.handle_opencode_event({
         "directory": str(tmp_path),
         "payload": {
@@ -473,6 +501,22 @@ async def test_tool_progress_is_reported_without_tool_arguments(tmp_path: Path) 
     progress = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
     assert "Using tool: bash" in progress
     assert "secret-command" not in progress
+    assert state.active_tools["tool-part"]["name"] == "bash"
+    assert "input" not in state.active_tools["tool-part"]
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "tool-part", "sessionID": "ses_1", "type": "tool",
+                    "tool": "bash", "state": {"status": "completed"},
+                }
+            },
+        },
+    })
+    assert state.active_tools == {}
 
 
 async def test_reasoning_phase_is_reported_without_reasoning_text(tmp_path: Path) -> None:
@@ -621,6 +665,90 @@ async def test_stop_marks_response_and_calls_abort(tmp_path: Path) -> None:
     assert state.watchdog_recovery_attempts == 0
 
 
+async def test_bump_reports_inactivity_then_confirm_resumes_same_pursuit_phase(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.time", lambda: 1_000.0)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        in_flight_event_id="$work",
+        prompt_started_ms=1,
+        pursuit_goal="Finish the research",
+        pursuit_phase="working",
+        pursuit_iteration=1,
+        acceptance_criteria=["Answer every material question with evidence"],
+    )
+    state.last_activity_ms = 100_000
+    store.rooms["!one:example"] = state
+    opencode.session_status.side_effect = [
+        {"ses_1": {"type": "busy"}},
+        {"ses_1": {"type": "busy"}},
+    ]
+    opencode.create_session.return_value = {
+        "id": "ses_recovered",
+        "title": "Recovered pursuit",
+    }
+
+    await bot.command_bump("!one:example", "")
+    prompt = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "15m 00s ago" in prompt
+    assert "!bump confirm" in prompt
+    assert state.bump_confirmation_session_id == "ses_1"
+
+    await bot.command_bump("!one:example", "confirm")
+    opencode.abort.assert_awaited_once_with("ses_1", str(tmp_path))
+    assert state.manual_bump_pending is False
+    assert state.session_id == "ses_recovered"
+    assert state.pursuit_phase == "working"
+    assert state.pursuit_iteration == 2
+    assert "Finish the research" in opencode.prompt_async.await_args.args[2]
+
+
+async def test_bump_confirmation_expires_when_activity_resumes(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$work", prompt_started_ms=1
+    )
+    state.last_activity_ms = 1
+    store.rooms["!one:example"] = state
+    opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
+
+    await bot.command_bump("!one:example", "")
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "answer", "sessionID": "ses_1",
+                    "type": "text", "text": "I am making progress",
+                }
+            },
+        },
+    })
+    await bot.edit_tasks["!one:example"]
+    assert state.bump_confirmation_session_id is None
+
+    await bot.command_bump("!one:example", "confirm")
+    opencode.abort.assert_not_awaited()
+    assert "No bump is awaiting confirmation" in matrix.room_send.await_args.kwargs["content"]["body"]
+
+
+async def test_bump_never_interrupts_pending_permission(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        in_flight_event_id="$work",
+        pending_permissions=[PendingPermission("perm", "Approve search", "web")],
+    )
+    await bot.command_bump("!one:example", "")
+    assert "waiting for permission" in matrix.room_send.await_args.kwargs["content"]["body"]
+    opencode.abort.assert_not_awaited()
+
+
 def assistant_message(*, created: int, completed: int | None = None, text: str = ""):
     time_value = {"created": created}
     if completed is not None:
@@ -653,6 +781,84 @@ async def test_watchdog_waits_for_full_silence_window(
     assert state.watchdog_recovery_pending is True
     assert state.watchdog_recovery_attempts == 1
     assert state.last_activity_ms == 1_000_000
+
+
+async def test_pursuit_stalled_tool_is_quarantined_and_resumed_in_fresh_worker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.time", lambda: 1_000.0)
+    state = RoomSession(
+        "ses_poisoned",
+        str(tmp_path),
+        in_flight_event_id="$event",
+        prompt_started_ms=900_000,
+        last_activity_ms=999_000,
+        pursuit_goal="Finish reliable research",
+        pursuit_phase="working",
+        pursuit_iteration=1,
+        acceptance_criteria=["Every claim has verified evidence"],
+        active_tools={"part": {"name": "bash", "started_ms": 879_000}},
+    )
+    store.rooms["!one:example"] = state
+    opencode.session_status.return_value = {"ses_poisoned": {"type": "busy"}}
+    opencode.messages.return_value = [assistant_message(created=900_001)]
+    opencode.create_session.return_value = {
+        "id": "ses_recovered",
+        "title": "Recovered pursuit",
+    }
+
+    await bot.watchdog_check()
+
+    opencode.abort.assert_awaited_once_with("ses_poisoned", str(tmp_path))
+    assert state.session_id == "ses_recovered"
+    assert state.pursuit_phase == "working"
+    assert state.pursuit_iteration == 2
+    assert state.watchdog_recovery_pending is False
+    assert state.recovery_reason is None
+    assert any("tool bash" in item for item in state.pursuit_reflections)
+    opencode.prompt_async.assert_awaited_once()
+    assert opencode.prompt_async.await_args.args[0] == "ses_recovered"
+    worker_prompt = opencode.prompt_async.await_args.args[2]
+    assert "bounded, non-interactive operations" in worker_prompt
+
+
+async def test_pursuit_stalled_verifier_is_recreated_immediately(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.time", lambda: 1_000.0)
+    state = RoomSession(
+        "ses_worker",
+        str(tmp_path),
+        in_flight_event_id="$event",
+        prompt_started_ms=900_000,
+        last_activity_ms=999_000,
+        pursuit_goal="Verify the answer",
+        pursuit_phase="verifying",
+        pursuit_iteration=2,
+        verifier_session_id="ses_verifier_poisoned",
+        acceptance_criteria=["The answer is evidenced"],
+        active_tools={"part": {"name": "webfetch", "started_ms": 879_000}},
+    )
+    store.rooms["!one:example"] = state
+    opencode.session_status.return_value = {
+        "ses_verifier_poisoned": {"type": "busy"}
+    }
+    opencode.messages.return_value = [assistant_message(created=900_001)]
+    opencode.create_session.return_value = {"id": "ses_verifier_recovered"}
+
+    await bot.watchdog_check()
+
+    opencode.abort.assert_awaited_once_with("ses_verifier_poisoned", str(tmp_path))
+    opencode.delete_session.assert_awaited_once_with(
+        "ses_verifier_poisoned", str(tmp_path)
+    )
+    assert state.session_id == "ses_worker"
+    assert state.verifier_session_id == "ses_verifier_recovered"
+    assert state.pursuit_phase == "verifying"
+    opencode.prompt_async.assert_awaited_once()
+    assert opencode.prompt_async.await_args.args[0] == "ses_verifier_recovered"
 
 
 async def test_watchdog_activity_and_permission_pause_recovery(
@@ -763,6 +969,28 @@ async def test_watchdog_aborts_then_continues_after_confirmed_idle(
     assert state.watchdog_recovery_pending is True
     assert state.watchdog_recovery_attempts == 2
     assert opencode.abort.await_count == 2
+
+
+async def test_watchdog_retries_rejected_abort_on_next_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.time", lambda: 1_000.0)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$event", prompt_started_ms=1
+    )
+    state.last_activity_ms = 1
+    store.rooms["!one:example"] = state
+    opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
+    opencode.messages.return_value = [assistant_message(created=2)]
+    opencode.abort.return_value = False
+
+    await bot.watchdog_check()
+    await bot.watchdog_check()
+
+    assert opencode.abort.await_count == 2
+    assert state.watchdog_recovery_pending is True
+    assert state.watchdog_recovery_attempts == 2
 
 
 async def test_abort_error_waits_for_idle_before_watchdog_continuation(

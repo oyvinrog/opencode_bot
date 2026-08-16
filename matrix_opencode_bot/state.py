@@ -45,6 +45,14 @@ class RoomSession:
     pursuit_protocol_failures: int = 0
     pursuit_retry_attempts: int = 0
     pursuit_last_worker_report: str | None = None
+    bump_confirmation_session_id: str | None = None
+    bump_confirmation_activity_ms: int | None = None
+    manual_bump_pending: bool = False
+    manual_bump_attempts: int = 0
+    active_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    recovery_reason: str | None = None
+    recovery_tool: str | None = None
+    recovery_session_id: str | None = None
     watchdog_recovery_pending: bool = False
     watchdog_recovery_attempts: int = 0
 
@@ -81,6 +89,14 @@ class RoomSession:
             "pursuit_protocol_failures": self.pursuit_protocol_failures,
             "pursuit_retry_attempts": self.pursuit_retry_attempts,
             "pursuit_last_worker_report": self.pursuit_last_worker_report,
+            "bump_confirmation_session_id": self.bump_confirmation_session_id,
+            "bump_confirmation_activity_ms": self.bump_confirmation_activity_ms,
+            "manual_bump_pending": self.manual_bump_pending,
+            "manual_bump_attempts": self.manual_bump_attempts,
+            "active_tools": self.active_tools,
+            "recovery_reason": self.recovery_reason,
+            "recovery_tool": self.recovery_tool,
+            "recovery_session_id": self.recovery_session_id,
             "watchdog_recovery_pending": self.watchdog_recovery_pending,
             "watchdog_recovery_attempts": self.watchdog_recovery_attempts,
         }
@@ -145,6 +161,26 @@ class RoomSession:
                 if value.get("pursuit_last_worker_report")
                 else None
             ),
+            bump_confirmation_session_id=(
+                str(value["bump_confirmation_session_id"])
+                if value.get("bump_confirmation_session_id")
+                else None
+            ),
+            bump_confirmation_activity_ms=value.get("bump_confirmation_activity_ms"),
+            manual_bump_pending=bool(value.get("manual_bump_pending", False)),
+            manual_bump_attempts=int(value.get("manual_bump_attempts") or 0),
+            active_tools=_active_tools(value.get("active_tools")),
+            recovery_reason=(
+                str(value["recovery_reason"]) if value.get("recovery_reason") else None
+            ),
+            recovery_tool=(
+                str(value["recovery_tool"]) if value.get("recovery_tool") else None
+            ),
+            recovery_session_id=(
+                str(value["recovery_session_id"])
+                if value.get("recovery_session_id")
+                else None
+            ),
             watchdog_recovery_pending=bool(
                 value.get("watchdog_recovery_pending", False)
             ),
@@ -197,3 +233,17 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if str(item).strip()]
+
+
+def _active_tools(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for part_id, tool in value.items():
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        result[str(part_id)] = {
+            "name": str(tool["name"]),
+            "started_ms": int(tool.get("started_ms") or 0),
+        }
+    return result

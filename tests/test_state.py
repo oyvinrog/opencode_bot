@@ -24,6 +24,14 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
             acceptance_criteria=["Answer is source-grounded"],
             pursuit_criteria_status={"Answer is source-grounded": "unknown"},
             pursuit_evidence=["Primary record found"],
+            bump_confirmation_session_id="ses_1",
+            bump_confirmation_activity_ms=122,
+            manual_bump_pending=True,
+            manual_bump_attempts=2,
+            active_tools={"part_1": {"name": "bash", "started_ms": 121}},
+            recovery_reason="tool_timeout",
+            recovery_tool="bash",
+            recovery_session_id="ses_1",
             watchdog_recovery_pending=True,
             watchdog_recovery_attempts=3,
         ),
@@ -36,6 +44,13 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
     assert restored.rooms["!room:example"].pursuit_iteration == 7
     assert restored.rooms["!room:example"].verifier_session_id == "ses_verify"
     assert restored.rooms["!room:example"].pursuit_evidence == ["Primary record found"]
+    assert restored.rooms["!room:example"].bump_confirmation_session_id == "ses_1"
+    assert restored.rooms["!room:example"].manual_bump_pending is True
+    assert restored.rooms["!room:example"].manual_bump_attempts == 2
+    assert restored.rooms["!room:example"].active_tools["part_1"]["name"] == "bash"
+    assert restored.rooms["!room:example"].recovery_reason == "tool_timeout"
+    assert restored.rooms["!room:example"].recovery_tool == "bash"
+    assert restored.rooms["!room:example"].recovery_session_id == "ses_1"
     assert restored.rooms["!room:example"].watchdog_recovery_pending is True
     assert restored.rooms["!room:example"].watchdog_recovery_attempts == 3
     assert stat.S_IMODE(path.stat().st_mode) == 0o600

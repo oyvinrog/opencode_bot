@@ -90,6 +90,8 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - Ordinary messages — prompt the current session, creating one in the default directory if needed
 - `!pursue <goal>` — pursue a goal until independently verified or `!stop`
 - `!status` — show the session, directory, activity, permissions, and change totals
+- `!bump` — report inactivity and ask before restarting the same stalled turn
+- `!bump confirm` / `!bump cancel` — approve or cancel the proposed restart
 - `!allow` — allow the oldest pending permission once
 - `!deny` — reject the oldest pending permission
 - `!diff` — show unified diffs for the session
@@ -130,15 +132,29 @@ commands are not posted; user-visible plan descriptions may mention files.
 Permission requests and errors are sent immediately. Replies longer than 20,000
 characters are split at completion.
 
-An in-process watchdog checks active bot-submitted prompts every 30 seconds. If
-OpenCode produces no session, message, tool, plan, retry, or permission activity
-for `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default), the bot aborts the
-stalled turn and continues the unfinished task in the same session. Each repeated
-recovery requires another full silent timeout, and `!stop` cancels automatic
-continuation. Pending permission requests are never interrupted. The watchdog also
+An in-process watchdog checks active bot-submitted prompts every 30 seconds.
+Ordinary turns use `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default).
+Pursuits use the shorter `OPENCODE_PURSUE_STUCK_TIMEOUT_SECONDS` (180 seconds),
+and a pursuit tool continuously reported as running has its own hard ceiling,
+`OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS` (120 seconds). A timeout aborts the turn,
+quarantines the poisoned pursuit worker or verifier session, and resumes the same
+phase in a fresh session with a durable warning not to repeat the failed approach.
+Each repeated recovery requires another full timeout, and `!stop` cancels automatic
+continuation. If OpenCode initially rejects the abort, the watchdog retries on its
+next 30-second check rather than waiting through another timeout. Pending permission
+requests are never interrupted. `!status` shows
+the active deadline as a countdown. The watchdog also
 reconciles missed idle events and OpenCode's occasional stale `busy` status by
 requiring a completed timestamp on the latest assistant message before treating a
 busy response as finished.
+
+`!bump` exposes the same recovery mechanism under explicit user control. It
+reports time since the last observable activity and compares it with the watchdog
+threshold, but never interrupts immediately. `!bump confirm` aborts and resumes
+only if the same turn has remained unchanged; any intervening activity expires the
+confirmation. During a pursuit, a confirmed bump also quarantines the active
+session before resuming. Turns waiting for `!allow` or `!deny` are not considered
+stalled.
 
 Set `MATRIX_SHOW_REASONING=true` to also stream the provider-exposed reasoning
 text that OpenCode displays in its thinking view. This text is shown only while

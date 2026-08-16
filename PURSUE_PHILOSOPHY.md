@@ -139,6 +139,23 @@ makes persistence meaningful. An endless system cannot distinguish success from
 failure; it can only consume time. `!pursue` continues without an arbitrary pass
 or token ceiling, but it stops when the evidence warrants stopping.
 
+Persistence must not make the operator powerless. The human can inspect progress,
+stop the pursuit, or use `!bump` when a turn appears stalled. A bump is deliberately
+a two-step act: the system first reports how long the turn has been inactive, and
+the user must then confirm the interruption. If new activity appears in between,
+the confirmation expires. This preserves both autonomy and agency—the controller
+can work for a long time without supervision, while the person remains the final
+authority over whether a silent turn should be disturbed.
+
+Operator control is a supplement to autonomous recovery, not a prerequisite for
+it. A pursuit watchdog treats prolonged silence—and especially a tool that remains
+in a running state beyond its deadline—as evidence that the execution context may
+be poisoned. It aborts that context, quarantines it, records the stalled tool and
+failed approach in durable reflection memory, and resumes the same phase in a
+fresh worker or verifier session. The recovery deadline is visible in `!status`.
+This avoids depending on the broken session to announce that it has become idle,
+while preserving the evidence and acceptance contract accumulated before it froze.
+
 Some conditions should pause rather than complete or fail. The user may need to
 choose a region, authorize an action, provide credentials, resolve an ambiguity,
 or decide among genuinely different interpretations of the goal. Safety and

@@ -42,6 +42,11 @@ WATCHDOG_CONTINUATION = (
     "session context. First inspect the current state, preserve completed work, and avoid "
     "repeating completed or side-effectful actions."
 )
+MANUAL_BUMP_CONTINUATION = (
+    "The user manually interrupted the previous turn because it appeared stalled. Continue the "
+    "unfinished task from the existing session context. First inspect the current state, preserve "
+    "completed work, and avoid repeating completed or side-effectful actions."
+)
 CONTROL_PATTERN = re.compile(
     r"<pursuit-control>\s*(\{.*?\})\s*</pursuit-control>", re.DOTALL
 )
@@ -60,6 +65,7 @@ HELP = """Matrix–OpenCode commands:
 Ordinary messages — prompt the current session, creating one if needed
 !pursue <goal> — pursue a goal until independently verified or !stop
 !status — show current activity
+!bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
 !allow / !deny — answer the oldest permission request
 !diff — show changed files
 !stop — stop a pursuit and abort the current operation
@@ -67,7 +73,7 @@ Ordinary messages — prompt the current session, creating one if needed
 !help — show this message"""
 
 SESSION_REMINDER = (
-    "Commands: !new [directory], !pursue <goal>, !status, !diff, !allow, !deny, "
+    "Commands: !new [directory], !pursue <goal>, !status, !bump, !diff, !allow, !deny, "
     "!stop, !reset, !help"
 )
 
@@ -135,6 +141,8 @@ class MatrixOpenCodeBot:
                 await self.command_new(room_id, argument.strip() or None)
             elif command == "!status":
                 await self.command_status(room_id)
+            elif command == "!bump":
+                await self.command_bump(room_id, argument.strip().lower())
             elif command == "!pursue":
                 await self.command_pursue(room_id, argument.strip())
             elif command == "!allow":
@@ -160,6 +168,20 @@ class MatrixOpenCodeBot:
         if state.pursuit_phase in {"specifying", "verifying"} and state.verifier_session_id:
             return state.verifier_session_id
         return state.session_id
+
+    def _stuck_timeout_seconds(self, state: RoomSession) -> int:
+        if state.pursuit_goal:
+            return self.settings.pursuit_stuck_timeout_seconds
+        return self.settings.stuck_timeout_seconds
+
+    @staticmethod
+    def _oldest_active_tool(state: RoomSession) -> tuple[str, int] | None:
+        tools = [
+            (str(value.get("name") or "tool"), _integer(value.get("started_ms")))
+            for value in state.active_tools.values()
+            if isinstance(value, dict) and _integer(value.get("started_ms")) > 0
+        ]
+        return min(tools, key=lambda item: item[1]) if tools else None
 
     async def _status(
         self, state: RoomSession, session_id: str | None = None
@@ -260,7 +282,10 @@ class MatrixOpenCodeBot:
         state.activity = "starting"
         state.activity_history.clear()
         state.plan_items.clear()
+        state.active_tools.clear()
         state.stop_requested = False
+        self._clear_bump_confirmation(state)
+        self._clear_recovery(state)
         await self.store.save()
         try:
             target = session_id or state.session_id
@@ -322,6 +347,8 @@ class MatrixOpenCodeBot:
             state.directory, title="Matrix pursuit verifier"
         )
         self._clear_pursuit(state)
+        self._clear_bump_confirmation(state)
+        state.manual_bump_pending = False
         state.watchdog_recovery_pending = False
         state.watchdog_recovery_attempts = 0
         state.pursuit_goal = goal
@@ -635,6 +662,18 @@ Return exactly:
         state.pursuit_protocol_failures = 0
         state.pursuit_retry_attempts = 0
         state.pursuit_last_worker_report = None
+        MatrixOpenCodeBot._clear_recovery(state)
+
+    @staticmethod
+    def _clear_recovery(state: RoomSession) -> None:
+        state.recovery_reason = None
+        state.recovery_tool = None
+        state.recovery_session_id = None
+
+    @staticmethod
+    def _clear_bump_confirmation(state: RoomSession) -> None:
+        state.bump_confirmation_session_id = None
+        state.bump_confirmation_activity_ms = None
 
     async def command_status(self, room_id: str) -> None:
         state = self.store.rooms.get(room_id)
@@ -654,12 +693,37 @@ Return exactly:
             lines.append(f"Activity: {state.activity}")
         if state.in_flight_event_id:
             lines.append(f"Last activity: {_activity_age_text(state)}")
+            if not state.pending_permissions and not state.watchdog_recovery_pending:
+                now_ms = int(time.time() * 1000)
+                active_tool = self._oldest_active_tool(state) if state.pursuit_goal else None
+                if active_tool:
+                    remaining = max(
+                        0,
+                        self.settings.pursuit_tool_timeout_seconds
+                        - ((now_ms - active_tool[1]) // 1000),
+                    )
+                    lines.append(
+                        f"Automatic recovery: tool {active_tool[0]} in "
+                        f"{_duration_text(remaining)}"
+                    )
+                else:
+                    last_ms = state.last_activity_ms or state.prompt_started_ms or now_ms
+                    remaining = max(
+                        0,
+                        self._stuck_timeout_seconds(state)
+                        - ((now_ms - last_ms) // 1000),
+                    )
+                    lines.append(f"Automatic recovery in {_duration_text(remaining)}")
         if state.watchdog_recovery_pending:
             lines.append(
                 f"Watchdog: recovery attempt {state.watchdog_recovery_attempts} pending"
             )
         elif state.watchdog_recovery_attempts:
             lines.append(f"Watchdog recoveries: {state.watchdog_recovery_attempts}")
+        if state.manual_bump_pending:
+            lines.append(f"Manual bump: attempt {state.manual_bump_attempts} pending")
+        elif state.bump_confirmation_session_id:
+            lines.append("Manual bump: awaiting !bump confirm or !bump cancel")
         if state.pursuit_goal:
             passed = sum(
                 1 for status_value in state.pursuit_criteria_status.values()
@@ -695,6 +759,147 @@ Return exactly:
             ]
         )
         await self.send_text(room_id, "\n".join(lines))
+
+    async def command_bump(self, room_id: str, action: str) -> None:
+        state = self.store.rooms.get(room_id)
+        if not state:
+            await self.send_text(room_id, "No session is mapped to this room.")
+            return
+        if action not in {"", "confirm", "cancel"}:
+            await self.send_text(room_id, "Usage: !bump [confirm|cancel]")
+            return
+
+        if action == "cancel":
+            if state.manual_bump_pending:
+                await self.send_text(
+                    room_id,
+                    "The bump was already confirmed and cannot be cancelled; use !stop to "
+                    "stop the recovery.",
+                )
+                return
+            had_confirmation = state.bump_confirmation_session_id is not None
+            self._clear_bump_confirmation(state)
+            await self.store.save()
+            await self.send_text(
+                room_id,
+                "Bump cancelled." if had_confirmation else "No bump confirmation is pending.",
+            )
+            return
+
+        if state.manual_bump_pending:
+            await self.send_text(
+                room_id, "A confirmed bump is already waiting for OpenCode to become idle."
+            )
+            return
+
+        if action == "confirm":
+            expected_session = state.bump_confirmation_session_id
+            if not expected_session:
+                await self.send_text(room_id, "No bump is awaiting confirmation. Send !bump first.")
+                return
+            active_session = self._active_session_id(state)
+            unchanged = (
+                state.bump_confirmation_activity_ms
+                == (state.last_activity_ms or state.prompt_started_ms)
+            )
+            if (
+                expected_session != active_session
+                or not state.in_flight_event_id
+                or not unchanged
+            ):
+                self._clear_bump_confirmation(state)
+                await self.store.save()
+                await self.send_text(
+                    room_id,
+                    "The turn changed or produced activity after the bump request; confirmation "
+                    "expired. Send !bump again to reassess it.",
+                )
+                return
+            if state.pending_permissions:
+                self._clear_bump_confirmation(state)
+                await self.store.save()
+                await self.send_text(
+                    room_id,
+                    "The turn is waiting for permission, not stalled. Use !allow or !deny.",
+                )
+                return
+            if (await self._status(state)).get("type") == "idle":
+                self._clear_bump_confirmation(state)
+                await self.store.save()
+                await self._complete_idle(room_id, state)
+                await self.send_text(
+                    room_id, "The turn had already finished; reconciled it without bumping."
+                )
+                return
+
+            self._clear_bump_confirmation(state)
+            state.manual_bump_pending = True
+            state.manual_bump_attempts += 1
+            active_tool = self._oldest_active_tool(state)
+            state.recovery_reason = "manual_bump"
+            state.recovery_tool = active_tool[0] if active_tool else None
+            state.recovery_session_id = active_session
+            state.activity = f"Manual bump requested (attempt {state.manual_bump_attempts})"
+            self._touch_activity(state)
+            await self.store.save()
+            stopped = await self.opencode.abort(active_session, state.directory)
+            if not stopped:
+                state.manual_bump_pending = False
+                self._clear_recovery(state)
+                await self.store.save()
+                await self.send_text(
+                    room_id, "OpenCode did not accept the bump; the turn remains active."
+                )
+                return
+            if state.pursuit_goal:
+                await self.send_text(
+                    room_id,
+                    "Bump accepted. Quarantining the stalled session and resuming the same "
+                    "pursuit phase now.",
+                )
+                await self._complete_idle(room_id, state)
+                return
+            await self.send_text(
+                room_id,
+                "Bump requested. The same task phase will resume after OpenCode confirms idle.",
+            )
+            return
+
+        if not state.in_flight_event_id:
+            await self.send_text(room_id, "There is no bot-submitted turn to bump.")
+            return
+        if state.pending_permissions:
+            await self.send_text(
+                room_id,
+                "The turn is waiting for permission, not stalled. Use !allow or !deny.",
+            )
+            return
+        if (await self._status(state)).get("type") == "idle":
+            await self._complete_idle(room_id, state)
+            await self.send_text(
+                room_id, "The turn had already finished; reconciled it without bumping."
+            )
+            return
+
+        active_session = self._active_session_id(state)
+        state.bump_confirmation_session_id = active_session
+        state.bump_confirmation_activity_ms = state.last_activity_ms or state.prompt_started_ms
+        await self.store.save()
+        age = _activity_age_text(state)
+        last_ms = state.last_activity_ms or state.prompt_started_ms or int(time.time() * 1000)
+        inactive_seconds = max(0, (int(time.time() * 1000) - last_ms) // 1000)
+        threshold = self._stuck_timeout_seconds(state)
+        assessment = (
+            f"This exceeds the automatic watchdog threshold of {threshold}s."
+            if inactive_seconds >= threshold
+            else f"The automatic watchdog threshold is {threshold}s and has not been reached."
+        )
+        await self.send_text(
+            room_id,
+            f"Last observable activity: {age}. {assessment}\n"
+            "Reply !bump confirm to abort and resume this exact turn, or !bump cancel. "
+            "Any new activity invalidates this confirmation.",
+        )
 
     async def command_permission(self, room_id: str, response: str) -> None:
         state = self.store.rooms.get(room_id)
@@ -738,6 +943,8 @@ Return exactly:
         active_session_id = self._active_session_id(state)
         active_was_verifier = bool(verifier and active_session_id == verifier)
         self._clear_pursuit(state)
+        self._clear_bump_confirmation(state)
+        state.manual_bump_pending = False
         state.watchdog_recovery_pending = False
         state.watchdog_recovery_attempts = 0
         await self.store.save()
@@ -859,14 +1066,28 @@ Return exactly:
 
         now_ms = int(time.time() * 1000)
         last_activity_ms = state.last_activity_ms or state.prompt_started_ms or now_ms
-        if now_ms - last_activity_ms < self.settings.stuck_timeout_seconds * 1000:
+        silence_timeout = self._stuck_timeout_seconds(state)
+        active_tool = self._oldest_active_tool(state) if state.pursuit_goal else None
+        tool_timed_out = bool(
+            active_tool
+            and now_ms - active_tool[1]
+            >= self.settings.pursuit_tool_timeout_seconds * 1000
+        )
+        turn_timed_out = now_ms - last_activity_ms >= silence_timeout * 1000
+        recovery_retry = state.watchdog_recovery_pending
+        if not recovery_retry and not tool_timed_out and not turn_timed_out:
             return
 
         state.watchdog_recovery_pending = True
         state.watchdog_recovery_attempts += 1
+        if not recovery_retry:
+            state.recovery_reason = "tool_timeout" if tool_timed_out else "turn_timeout"
+            state.recovery_tool = active_tool[0] if tool_timed_out and active_tool else None
+            state.recovery_session_id = active_session_id
         state.last_activity_ms = now_ms
         state.activity = (
-            f"Watchdog interrupting stalled turn "
+            f"Watchdog interrupting stalled "
+            f"{'tool ' + state.recovery_tool if state.recovery_tool else 'turn'} "
             f"(attempt {state.watchdog_recovery_attempts})"
         )
         await self.store.save()
@@ -876,9 +1097,9 @@ Return exactly:
             )
 
         LOG.warning(
-            "Watchdog interrupting session %s after %ss without activity (attempt %s)",
+            "Watchdog interrupting session %s after stalled %s (attempt %s)",
             active_session_id,
-            self.settings.stuck_timeout_seconds,
+            state.recovery_tool or f"turn ({silence_timeout}s silence)",
             state.watchdog_recovery_attempts,
         )
         stopped = await self.opencode.abort(active_session_id, state.directory)
@@ -888,6 +1109,11 @@ Return exactly:
                 await self.send_edit(
                     room_id, state.in_flight_event_id, self._progress_text(state)
                 )
+            return
+        if state.pursuit_goal:
+            # Do not depend on a poisoned session emitting session.idle after a successful
+            # abort. It is quarantined, so late events from it will no longer be routed here.
+            await self._complete_idle(room_id, state)
 
     async def _complete_idle(self, room_id: str, state: RoomSession) -> None:
         if not state.in_flight_event_id:
@@ -895,21 +1121,40 @@ Return exactly:
             state.stop_requested = False
             return
 
-        recovering = state.watchdog_recovery_pending
+        manual_bump = state.manual_bump_pending
+        recovering = state.watchdog_recovery_pending or manual_bump
         if recovering:
             partial = self._combined_text(state) or await self._recover_response(state)
+            if state.recovery_reason == "tool_timeout":
+                automatic_notice = (
+                    f"⚠️ Watchdog interrupted stalled tool {state.recovery_tool or 'tool'} after "
+                    f"{self.settings.pursuit_tool_timeout_seconds}s. Continuing automatically "
+                    "in a fresh pursuit session."
+                )
+            else:
+                automatic_notice = (
+                    f"⚠️ Watchdog interrupted this turn after "
+                    f"{self._stuck_timeout_seconds(state)}s without activity. "
+                    "Continuing automatically"
+                    + (" in a fresh pursuit session." if state.pursuit_goal else ".")
+                )
             notice = (
-                f"⚠️ Watchdog interrupted this turn after "
-                f"{self.settings.stuck_timeout_seconds}s without activity. "
-                "Continuing automatically."
+                "⚠️ The user confirmed a manual bump. Continuing the same unfinished phase."
+                if manual_bump
+                else automatic_notice
             )
             final_text = f"{partial}\n\n{notice}" if partial else notice
             state.watchdog_recovery_pending = False
+            state.manual_bump_pending = False
             await self.finalize(room_id, state, final_text)
             if state.pursuit_goal:
+                await self._rotate_pursuit_session_after_recovery(state)
                 await self._resume_pursuit_phase(room_id, state)
             else:
-                await self._submit_prompt(room_id, state, WATCHDOG_CONTINUATION)
+                continuation = (
+                    MANUAL_BUMP_CONTINUATION if manual_bump else WATCHDOG_CONTINUATION
+                )
+                await self._submit_prompt(room_id, state, continuation)
             return
 
         state.watchdog_recovery_pending = False
@@ -919,6 +1164,30 @@ Return exactly:
             await self._handle_pursuit_idle(room_id, state, raw)
         else:
             await self.finalize(room_id, state, raw or None)
+
+    async def _rotate_pursuit_session_after_recovery(
+        self, state: RoomSession
+    ) -> None:
+        tool = state.recovery_tool
+        reason = state.recovery_reason or "stalled turn"
+        detail = f" while running tool {tool}" if tool else ""
+        state.pursuit_reflections.append(
+            f"The previous {state.pursuit_phase} session was quarantined after {reason}{detail}. "
+            "Do not repeat the same approach. Use bounded, non-interactive operations; prefer "
+            "purpose-built task tools over ad-hoc shell pipelines, and verify each result before "
+            "accepting or writing the deliverable."
+        )
+        state.pursuit_reflections = state.pursuit_reflections[-10:]
+        if state.pursuit_phase == "working":
+            worker = await self.opencode.create_session(
+                state.directory, title="Matrix OpenCode pursuit (recovered)"
+            )
+            state.session_id = str(worker["id"])
+            state.title = str(worker.get("title") or state.title)
+        elif state.pursuit_phase in {"specifying", "verifying"}:
+            await self._replace_verifier(state)
+        self._clear_recovery(state)
+        await self.store.save()
 
     async def handle_opencode_event(self, event: dict[str, Any]) -> None:
         directory = event.get("directory")
@@ -953,6 +1222,9 @@ Return exactly:
         properties: dict[str, Any],
     ) -> None:
         if event_type != "session.idle":
+            if state.bump_confirmation_session_id:
+                self._clear_bump_confirmation(state)
+                await self.store.save()
             self._touch_activity(state)
 
         if event_type == "permission.updated":
@@ -1007,6 +1279,18 @@ Return exactly:
                 if isinstance(tool_state, dict):
                     status = str(tool_state.get("status") or "pending")
                     tool = _safe_activity_label(part.get("tool") or "tool")
+                    part_id = str(part.get("id") or tool)
+                    tools_changed = False
+                    if status in {"pending", "running"}:
+                        if part_id not in state.active_tools:
+                            state.active_tools[part_id] = {
+                                "name": tool,
+                                "started_ms": int(time.time() * 1000),
+                            }
+                            tools_changed = True
+                    elif part_id in state.active_tools:
+                        state.active_tools.pop(part_id, None)
+                        tools_changed = True
                     verb = {
                         "pending": "Preparing tool",
                         "running": "Using tool",
@@ -1014,6 +1298,8 @@ Return exactly:
                         "error": "Tool failed",
                     }.get(status, "Tool")
                     self._set_activity(state, f"{verb}: {tool}")
+                    if tools_changed:
+                        await self.store.save()
                     self.schedule_live_edit(room_id, state)
             elif part_type == "patch":
                 files = part.get("files", [])
@@ -1070,7 +1356,7 @@ Return exactly:
         if event_type == "session.error" and state.in_flight_event_id:
             error = properties.get("error") or {}
             detail = _event_error(error)
-            if state.watchdog_recovery_pending:
+            if state.watchdog_recovery_pending or state.manual_bump_pending:
                 self._set_activity(state, f"Watchdog interruption: {detail}")
                 self.schedule_live_edit(room_id, state)
                 return
@@ -1229,8 +1515,12 @@ Return exactly:
         state.activity = None
         state.activity_history.clear()
         state.plan_items.clear()
+        state.active_tools.clear()
         state.stop_requested = False
         state.last_activity_ms = None
+        state.bump_confirmation_session_id = None
+        state.bump_confirmation_activity_ms = None
+        state.manual_bump_pending = False
 
     async def validate_restored_state(self) -> None:
         changed = False
@@ -1274,6 +1564,12 @@ Return exactly:
                         # Do not immediately interrupt a restored run based on an old prompt
                         # timestamp. Give it a complete silence window after this process starts.
                         self._touch_activity(state)
+                        # Persisted tool timestamps come from the previous process. Give a
+                        # restored operation one complete tool window before quarantining it.
+                        now_ms = int(time.time() * 1000)
+                        for tool in state.active_tools.values():
+                            tool["started_ms"] = now_ms
+                        changed = True
                         if (await self._status(state)).get("type") == "idle":
                             await self._complete_idle(room_id, state)
                 except ValueError as exc:
@@ -1548,6 +1844,17 @@ def _elapsed_text(started_ms: int | None) -> str:
         return f"{minutes}m {seconds:02d}s elapsed"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes:02d}m elapsed"
+
+
+def _duration_text(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 
 def _activity_age_text(state: RoomSession) -> str:
