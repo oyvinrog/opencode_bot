@@ -19,6 +19,8 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
             pending_permissions=[PendingPermission("perm_1", "Run", "bash", "git status", 5)],
             obsess_goal="Investigate forever",
             obsess_iteration=7,
+            watchdog_recovery_pending=True,
+            watchdog_recovery_attempts=3,
         ),
     )
     restored = StateStore(path)
@@ -27,6 +29,8 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
     assert restored.rooms["!room:example"].pending_permissions[0].pattern == "git status"
     assert restored.rooms["!room:example"].obsess_goal == "Investigate forever"
     assert restored.rooms["!room:example"].obsess_iteration == 7
+    assert restored.rooms["!room:example"].watchdog_recovery_pending is True
+    assert restored.rooms["!room:example"].watchdog_recovery_attempts == 3
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert not path.with_suffix(".json.tmp").exists()
 

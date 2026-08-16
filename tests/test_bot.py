@@ -384,9 +384,224 @@ async def test_stop_marks_response_and_calls_abort(tmp_path: Path) -> None:
     state = RoomSession("ses_1", str(tmp_path), in_flight_event_id="$event")
     store.rooms["!one:example"] = state
     opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
+    state.watchdog_recovery_pending = True
+    state.watchdog_recovery_attempts = 4
     await bot.command_stop("!one:example")
     opencode.abort.assert_awaited_once_with("ses_1", str(tmp_path))
     assert state.stop_requested is True
+    assert state.watchdog_recovery_pending is False
+    assert state.watchdog_recovery_attempts == 0
+
+
+def assistant_message(*, created: int, completed: int | None = None, text: str = ""):
+    time_value = {"created": created}
+    if completed is not None:
+        time_value["completed"] = completed
+    return {
+        "info": {"role": "assistant", "time": time_value},
+        "parts": [{"type": "text", "text": text}] if text else [],
+    }
+
+
+async def test_watchdog_waits_for_full_silence_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.time", lambda: 1_000.0)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$event", prompt_started_ms=1
+    )
+    state.last_activity_ms = 101_000
+    store.rooms["!one:example"] = state
+    opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
+    opencode.messages.return_value = [assistant_message(created=2)]
+
+    await bot.watchdog_check()
+    opencode.abort.assert_not_awaited()
+
+    state.last_activity_ms = 100_000
+    await bot.watchdog_check()
+    opencode.abort.assert_awaited_once_with("ses_1", str(tmp_path))
+    assert state.watchdog_recovery_pending is True
+    assert state.watchdog_recovery_attempts == 1
+    assert state.last_activity_ms == 1_000_000
+
+
+async def test_watchdog_activity_and_permission_pause_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    current_time = 1_000.0
+    monkeypatch.setattr(
+        "matrix_opencode_bot.bot.time.time", lambda: current_time
+    )
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        in_flight_event_id="$event",
+        prompt_started_ms=1,
+        pending_permissions=[PendingPermission("perm", "Approve", "bash")],
+    )
+    state.last_activity_ms = 1
+    store.rooms["!one:example"] = state
+    opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
+    opencode.messages.return_value = [assistant_message(created=2)]
+
+    await bot.watchdog_check()
+    opencode.abort.assert_not_awaited()
+
+    current_time = 1_001.0
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "session.status",
+            "properties": {"sessionID": "ses_1", "status": {"type": "busy"}},
+        },
+    })
+    assert state.last_activity_ms == 1_001_000
+    await bot.edit_tasks["!one:example"]
+
+
+async def test_watchdog_reconciles_missed_idle_event(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$event", prompt_started_ms=1
+    )
+    state.text_parts["answer"] = "Recovered answer"
+    store.rooms["!one:example"] = state
+
+    await bot.watchdog_check()
+
+    assert state.in_flight_event_id is None
+    body = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
+    assert body == "Recovered answer"
+    opencode.abort.assert_not_awaited()
+
+
+async def test_watchdog_clears_stale_busy_only_for_completed_message(
+    tmp_path: Path,
+) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$event", prompt_started_ms=1
+    )
+    store.rooms["!one:example"] = state
+    opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
+    opencode.messages.return_value = [
+        assistant_message(created=2, completed=3, text="Already finished")
+    ]
+
+    await bot.watchdog_check()
+
+    opencode.abort.assert_awaited_once_with("ses_1", str(tmp_path))
+    opencode.prompt_async.assert_not_awaited()
+    assert state.in_flight_event_id is None
+    body = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
+    assert body == "Already finished"
+
+
+async def test_watchdog_aborts_then_continues_after_confirmed_idle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.time", lambda: 1_000.0)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$event", prompt_started_ms=1
+    )
+    state.last_activity_ms = 1
+    store.rooms["!one:example"] = state
+    opencode.session_status.side_effect = [
+        {"ses_1": {"type": "busy"}},
+        {},
+        {"ses_1": {"type": "busy"}},
+    ]
+    opencode.messages.return_value = [assistant_message(created=2)]
+
+    await bot.watchdog_check()
+    assert state.watchdog_recovery_pending is True
+    assert state.in_flight_event_id == "$event"
+    opencode.prompt_async.assert_not_awaited()
+
+    await bot.watchdog_check()
+    assert state.watchdog_recovery_pending is False
+    assert state.watchdog_recovery_attempts == 1
+    assert state.in_flight_event_id is not None
+    continuation = opencode.prompt_async.await_args.args[2]
+    assert "automatically interrupted" in continuation
+    assert "avoid repeating" in continuation
+
+    state.last_activity_ms = 1
+    await bot.watchdog_check()
+    assert state.watchdog_recovery_pending is True
+    assert state.watchdog_recovery_attempts == 2
+    assert opencode.abort.await_count == 2
+
+
+async def test_abort_error_waits_for_idle_before_watchdog_continuation(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        in_flight_event_id="$event",
+        prompt_started_ms=1,
+        watchdog_recovery_pending=True,
+        watchdog_recovery_attempts=1,
+    )
+    store.rooms["!one:example"] = state
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "session.error",
+            "properties": {
+                "sessionID": "ses_1",
+                "error": {"message": "aborted"},
+            },
+        },
+    })
+
+    assert state.in_flight_event_id == "$event"
+    assert state.watchdog_recovery_pending is True
+    opencode.prompt_async.assert_not_awaited()
+    await bot.edit_tasks["!one:example"]
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {"type": "session.idle", "properties": {"sessionID": "ses_1"}},
+    })
+    opencode.prompt_async.assert_awaited_once()
+
+
+async def test_restored_pending_recovery_continues_when_idle(tmp_path: Path) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        in_flight_event_id="$event",
+        prompt_started_ms=1,
+        watchdog_recovery_pending=True,
+        watchdog_recovery_attempts=2,
+    )
+    store.rooms["!one:example"] = state
+
+    await bot.validate_restored_state()
+
+    opencode.prompt_async.assert_awaited_once()
+    assert state.watchdog_recovery_pending is False
+    assert state.watchdog_recovery_attempts == 2
+    assert state.last_activity_ms is not None
+
+
+async def test_watchdog_task_is_cancelled_on_close(tmp_path: Path) -> None:
+    bot, _, _, _ = make_bot(tmp_path)
+    bot.start_watchdog()
+    task = bot.watchdog_task
+    assert task is not None
+    await bot.close()
+    assert task.cancelled()
+    assert bot.watchdog_task is None
 
 
 def test_render_diffs_and_chunking() -> None:

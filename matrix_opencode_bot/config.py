@@ -24,6 +24,19 @@ def env_set(name: str) -> frozenset[str]:
     )
 
 
+def env_positive_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
 @dataclass(frozen=True)
 class Settings:
     homeserver: str
@@ -41,6 +54,7 @@ class Settings:
     default_directory: Path
     allowed_roots: tuple[Path, ...]
     show_reasoning: bool = False
+    stuck_timeout_seconds: int = 900
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -91,6 +105,9 @@ class Settings:
             default_directory=default_directory,
             allowed_roots=roots,
             show_reasoning=env_bool("MATRIX_SHOW_REASONING", False),
+            stuck_timeout_seconds=env_positive_int(
+                "OPENCODE_STUCK_TIMEOUT_SECONDS", 900
+            ),
         )
 
     def resolve_directory(self, requested: str | None) -> Path:

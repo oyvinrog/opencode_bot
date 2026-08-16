@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from matrix_opencode_bot.config import Settings, env_bool
+from matrix_opencode_bot.config import Settings, env_bool, env_positive_int
 
 
 def configure(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
@@ -23,6 +23,7 @@ def test_settings_parse_required_values(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert settings.allowed_senders == frozenset({"@alice:example"})
     assert settings.opencode_url == "http://127.0.0.1:4096"
     assert settings.show_reasoning is False
+    assert settings.stuck_timeout_seconds == 900
 
 
 def test_settings_can_enable_reasoning(
@@ -98,3 +99,20 @@ def test_invalid_boolean(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BAD_BOOL", "perhaps")
     with pytest.raises(ValueError):
         env_bool("BAD_BOOL", True)
+
+
+def test_stuck_timeout_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENCODE_STUCK_TIMEOUT_SECONDS", "120")
+    assert Settings.from_env().stuck_timeout_seconds == 120
+    for invalid in ("0", "-1", "soon"):
+        monkeypatch.setenv("OPENCODE_STUCK_TIMEOUT_SECONDS", invalid)
+        with pytest.raises(ValueError, match="positive integer"):
+            Settings.from_env()
+
+
+def test_positive_int_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("UNSET_POSITIVE_INT", raising=False)
+    assert env_positive_int("UNSET_POSITIVE_INT", 7) == 7

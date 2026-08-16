@@ -34,6 +34,13 @@ LOG = logging.getLogger("matrix_opencode")
 MAX_MESSAGE_CHARS = 20_000
 MAX_REASONING_CHARS = 8_000
 EDIT_INTERVAL_SECONDS = 1.0
+WATCHDOG_POLL_SECONDS = 30.0
+WATCHDOG_CONTINUATION = (
+    "The previous turn was automatically interrupted because it produced no activity for "
+    "the configured watchdog timeout. Continue the user's unfinished task from the existing "
+    "session context. First inspect the current state, preserve completed work, and avoid "
+    "repeating completed or side-effectful actions."
+)
 
 HELP = """Matrix–OpenCode commands:
 !new [directory] — start a session
@@ -69,6 +76,7 @@ class MatrixOpenCodeBot:
         self.room_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.edit_tasks: dict[str, asyncio.Task[None]] = {}
         self.last_edit: dict[str, float] = {}
+        self.watchdog_task: asyncio.Task[None] | None = None
 
     def room_allowed(self, room: MatrixRoom) -> bool:
         return room.room_id in self.settings.allowed_rooms
@@ -194,6 +202,8 @@ class MatrixOpenCodeBot:
                 f"\n\n{SESSION_REMINDER}",
             )
 
+        state.watchdog_recovery_pending = False
+        state.watchdog_recovery_attempts = 0
         await self._submit_prompt(room_id, state, text)
 
     async def _submit_prompt(self, room_id: str, state: RoomSession, text: str) -> bool:
@@ -210,6 +220,7 @@ class MatrixOpenCodeBot:
             return False
         state.in_flight_event_id = event_id
         state.prompt_started_ms = int(time.time() * 1000)
+        state.last_activity_ms = state.prompt_started_ms
         state.text_parts.clear()
         state.reasoning_parts.clear()
         state.activity = "starting"
@@ -242,6 +253,8 @@ class MatrixOpenCodeBot:
         if state.in_flight_event_id or status.get("type") != "idle":
             await self.send_text(room_id, "This session is busy. Wait for it to finish or use !stop.")
             return
+        state.watchdog_recovery_pending = False
+        state.watchdog_recovery_attempts = 0
         state.obsess_goal = goal
         state.obsess_iteration = 1
         await self.store.save()
@@ -293,6 +306,14 @@ class MatrixOpenCodeBot:
         ]
         if state.activity:
             lines.append(f"Activity: {state.activity}")
+        if state.in_flight_event_id:
+            lines.append(f"Last activity: {_activity_age_text(state)}")
+        if state.watchdog_recovery_pending:
+            lines.append(
+                f"Watchdog: recovery attempt {state.watchdog_recovery_attempts} pending"
+            )
+        elif state.watchdog_recovery_attempts:
+            lines.append(f"Watchdog recoveries: {state.watchdog_recovery_attempts}")
         if state.obsess_goal:
             lines.append(f"Obsessing: pass {state.obsess_iteration} — {state.obsess_goal}")
         if status.get("type") == "retry":
@@ -320,6 +341,7 @@ class MatrixOpenCodeBot:
             state.session_id, pending.id, state.directory, response
         )
         state.pending_permissions = [item for item in state.pending_permissions if item.id != pending.id]
+        self._touch_activity(state)
         await self.store.save()
         verb = "Allowed once" if response == "once" else "Denied"
         await self.send_text(room_id, f"{verb}: {pending.title}")
@@ -343,6 +365,8 @@ class MatrixOpenCodeBot:
         was_obsessing = state.obsess_goal is not None
         state.obsess_goal = None
         state.obsess_iteration = 0
+        state.watchdog_recovery_pending = False
+        state.watchdog_recovery_attempts = 0
         await self.store.save()
         status = await self._status(state)
         if status.get("type") == "idle":
@@ -385,6 +409,129 @@ class MatrixOpenCodeBot:
             except Exception:
                 LOG.exception("Failed to process OpenCode event")
 
+    def start_watchdog(self) -> None:
+        if self.watchdog_task and not self.watchdog_task.done():
+            return
+        self.watchdog_task = asyncio.create_task(self.run_watchdog())
+
+    async def run_watchdog(self) -> None:
+        while not self.stop_events.is_set():
+            try:
+                await asyncio.wait_for(
+                    self.stop_events.wait(), timeout=WATCHDOG_POLL_SECONDS
+                )
+                return
+            except TimeoutError:
+                pass
+            await self.watchdog_check()
+
+    async def watchdog_check(self) -> None:
+        for room_id, state in list(self.store.rooms.items()):
+            if not state.in_flight_event_id:
+                continue
+            async with self.room_locks[room_id]:
+                if not state.in_flight_event_id:
+                    continue
+                try:
+                    await self._watchdog_room(room_id, state)
+                except asyncio.CancelledError:
+                    raise
+                except OpenCodeError as exc:
+                    LOG.warning(
+                        "Watchdog could not inspect OpenCode session %s in %s: %s",
+                        state.session_id,
+                        room_id,
+                        exc,
+                    )
+                except Exception:
+                    LOG.exception("Watchdog failed for OpenCode session %s", state.session_id)
+
+    async def _watchdog_room(self, room_id: str, state: RoomSession) -> None:
+        status = await self._status(state)
+        if status.get("type") == "idle":
+            await self._complete_idle(room_id, state)
+            return
+
+        if state.pending_permissions:
+            return
+
+        # A completed assistant record is stronger evidence than the occasionally stale
+        # session status map. Incomplete assistant records are created while a turn runs,
+        # so completion metadata is required before taking this path.
+        messages = await self.opencode.messages(state.session_id, state.directory, limit=20)
+        latest_assistant = _latest_assistant_for_prompt(messages, state.prompt_started_ms)
+        if latest_assistant and _message_completed(latest_assistant):
+            cleared = await self.opencode.abort(state.session_id, state.directory)
+            if not cleared:
+                LOG.warning(
+                    "Watchdog found a completed response for %s but could not clear stale busy status",
+                    state.session_id,
+                )
+                return
+            LOG.warning("Watchdog cleared stale busy status for %s", state.session_id)
+            await self._complete_idle(room_id, state)
+            return
+
+        now_ms = int(time.time() * 1000)
+        last_activity_ms = state.last_activity_ms or state.prompt_started_ms or now_ms
+        if now_ms - last_activity_ms < self.settings.stuck_timeout_seconds * 1000:
+            return
+
+        state.watchdog_recovery_pending = True
+        state.watchdog_recovery_attempts += 1
+        state.last_activity_ms = now_ms
+        state.activity = (
+            f"Watchdog interrupting stalled turn "
+            f"(attempt {state.watchdog_recovery_attempts})"
+        )
+        await self.store.save()
+        if state.in_flight_event_id:
+            await self.send_edit(
+                room_id, state.in_flight_event_id, self._progress_text(state)
+            )
+
+        LOG.warning(
+            "Watchdog interrupting session %s after %ss without activity (attempt %s)",
+            state.session_id,
+            self.settings.stuck_timeout_seconds,
+            state.watchdog_recovery_attempts,
+        )
+        stopped = await self.opencode.abort(state.session_id, state.directory)
+        if not stopped:
+            state.activity = "Watchdog interrupt failed; retrying after the timeout"
+            if state.in_flight_event_id:
+                await self.send_edit(
+                    room_id, state.in_flight_event_id, self._progress_text(state)
+                )
+
+    async def _complete_idle(self, room_id: str, state: RoomSession) -> None:
+        if not state.in_flight_event_id:
+            state.activity = None
+            state.stop_requested = False
+            return
+
+        recovering = state.watchdog_recovery_pending
+        if recovering:
+            partial = self._combined_text(state) or await self._recover_response(state)
+            notice = (
+                f"⚠️ Watchdog interrupted this turn after "
+                f"{self.settings.stuck_timeout_seconds}s without activity. "
+                "Continuing automatically."
+            )
+            final_text = f"{partial}\n\n{notice}" if partial else notice
+            state.watchdog_recovery_pending = False
+            await self.finalize(room_id, state, final_text)
+            if state.obsess_goal:
+                await self._continue_obsession(room_id, state)
+            else:
+                await self._submit_prompt(room_id, state, WATCHDOG_CONTINUATION)
+            return
+
+        state.watchdog_recovery_pending = False
+        state.watchdog_recovery_attempts = 0
+        await self.finalize(room_id, state)
+        await self._continue_obsession(room_id, state)
+
     async def handle_opencode_event(self, event: dict[str, Any]) -> None:
         directory = event.get("directory")
         payload = event.get("payload", event)
@@ -415,6 +562,9 @@ class MatrixOpenCodeBot:
         event_type: str,
         properties: dict[str, Any],
     ) -> None:
+        if event_type != "session.idle":
+            self._touch_activity(state)
+
         if event_type == "permission.updated":
             permission_id = str(properties.get("id", ""))
             if not permission_id or any(p.id == permission_id for p in state.pending_permissions):
@@ -529,13 +679,21 @@ class MatrixOpenCodeBot:
         if event_type == "session.error" and state.in_flight_event_id:
             error = properties.get("error") or {}
             detail = _event_error(error)
+            if state.watchdog_recovery_pending:
+                self._set_activity(state, f"Watchdog interruption: {detail}")
+                self.schedule_live_edit(room_id, state)
+                return
             await self.finalize(room_id, state, f"OpenCode error: {detail}")
             return
 
         if event_type == "session.idle":
             if state.in_flight_event_id:
-                await self.finalize(room_id, state)
-                await self._continue_obsession(room_id, state)
+                # An idle event from an aborted turn can arrive after its continuation has
+                # started. Confirm current server state before finalizing the current turn.
+                if (await self._status(state)).get("type") != "idle":
+                    LOG.info("Ignoring stale idle event for busy session %s", state.session_id)
+                    return
+                await self._complete_idle(room_id, state)
             else:
                 state.activity = None
                 state.stop_requested = False
@@ -613,7 +771,11 @@ class MatrixOpenCodeBot:
         activity = state.activity or "Working"
         elapsed = _elapsed_text(state.prompt_started_ms)
         status_line = f"⏳ {activity}{f' · {elapsed}' if elapsed else ''}"
-        details: list[str] = []
+        details: list[str] = [f"Last activity: {_activity_age_text(state)}"]
+        if state.watchdog_recovery_pending:
+            details.append(
+                f"Watchdog recovery attempt {state.watchdog_recovery_attempts} pending"
+            )
         if state.plan_items:
             completed = sum(1 for _, status in state.plan_items if status == "completed")
             plan = [f"📋 Plan ({completed}/{len(state.plan_items)} complete):"]
@@ -648,6 +810,10 @@ class MatrixOpenCodeBot:
         state.activity = activity
 
     @staticmethod
+    def _touch_activity(state: RoomSession) -> None:
+        state.last_activity_ms = int(time.time() * 1000)
+
+    @staticmethod
     def _clear_in_flight(state: RoomSession) -> None:
         state.in_flight_event_id = None
         state.prompt_started_ms = None
@@ -657,30 +823,44 @@ class MatrixOpenCodeBot:
         state.activity_history.clear()
         state.plan_items.clear()
         state.stop_requested = False
+        state.last_activity_ms = None
 
     async def validate_restored_state(self) -> None:
         changed = False
         for room_id, state in list(self.store.rooms.items()):
-            try:
-                self.settings.resolve_directory(state.directory)
-                session = await self.opencode.get_session(state.session_id, state.directory)
-                title = str(session.get("title") or state.title)
-                if title != state.title:
-                    state.title = title
-                    changed = True
-                if state.in_flight_event_id and (await self._status(state)).get("type") == "idle":
-                    await self.finalize(room_id, state)
-            except ValueError as exc:
-                LOG.warning("Discarding invalid restored mapping for %s: %s", room_id, exc)
-                self.store.rooms.pop(room_id, None)
-                changed = True
-            except OpenCodeError as exc:
-                if exc.status_code == 404:
-                    LOG.warning("Discarding missing restored session for %s: %s", room_id, exc)
+            async with self.room_locks[room_id]:
+                if self.store.rooms.get(room_id) is not state:
+                    continue
+                try:
+                    self.settings.resolve_directory(state.directory)
+                    session = await self.opencode.get_session(
+                        state.session_id, state.directory
+                    )
+                    title = str(session.get("title") or state.title)
+                    if title != state.title:
+                        state.title = title
+                        changed = True
+                    if state.in_flight_event_id:
+                        # Do not immediately interrupt a restored run based on an old prompt
+                        # timestamp. Give it a complete silence window after this process starts.
+                        self._touch_activity(state)
+                        if (await self._status(state)).get("type") == "idle":
+                            await self._complete_idle(room_id, state)
+                except ValueError as exc:
+                    LOG.warning("Discarding invalid restored mapping for %s: %s", room_id, exc)
                     self.store.rooms.pop(room_id, None)
                     changed = True
-                else:
-                    LOG.warning("Could not validate restored mapping for %s; retaining it: %s", room_id, exc)
+                except OpenCodeError as exc:
+                    if exc.status_code == 404:
+                        LOG.warning("Discarding missing restored session for %s: %s", room_id, exc)
+                        self.store.rooms.pop(room_id, None)
+                        changed = True
+                    else:
+                        LOG.warning(
+                            "Could not validate restored mapping for %s; retaining it: %s",
+                            room_id,
+                            exc,
+                        )
         if changed:
             await self.store.save()
 
@@ -739,6 +919,11 @@ class MatrixOpenCodeBot:
 
     async def close(self) -> None:
         self.stop_events.set()
+        if self.watchdog_task:
+            self.watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.watchdog_task
+            self.watchdog_task = None
         for task in self.edit_tasks.values():
             task.cancel()
         if self.edit_tasks:
@@ -837,6 +1022,44 @@ def _elapsed_text(started_ms: int | None) -> str:
     return f"{hours}h {minutes:02d}m elapsed"
 
 
+def _activity_age_text(state: RoomSession) -> str:
+    last_activity_ms = state.last_activity_ms or state.prompt_started_ms
+    if not last_activity_ms:
+        return "unknown"
+    seconds = max(0, (int(time.time() * 1000) - last_activity_ms) // 1000)
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s ago"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m ago"
+
+
+def _latest_assistant_for_prompt(
+    messages: list[dict[str, Any]], prompt_started_ms: int | None
+) -> dict[str, Any] | None:
+    threshold = (prompt_started_ms or 0) - 1000
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info", {})
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        created = _integer((info.get("time") or {}).get("created"))
+        if created >= threshold:
+            return message
+    return None
+
+
+def _message_completed(message: dict[str, Any]) -> bool:
+    info = message.get("info", {})
+    if not isinstance(info, dict):
+        return False
+    time_value = info.get("time", {})
+    return isinstance(time_value, dict) and _integer(time_value.get("completed")) > 0
+
+
 def _integer(value: Any) -> int:
     try:
         return int(value)
@@ -918,9 +1141,10 @@ async def run() -> None:
             client.add_event_callback(bot.on_invite, InviteMemberEvent)
             # Load membership and crypto state before edits used for restart recovery.
             await client.sync(timeout=30_000, full_state=True, set_presence="online")
-            await bot.validate_restored_state()
             event_task = asyncio.create_task(bot.run_event_loop())
+            await bot.validate_restored_state()
             await bot.resume_obsessions()
+            bot.start_watchdog()
             LOG.info(
                 "Matrix OpenCode bot logged in as %s on device %s",
                 client.user_id,

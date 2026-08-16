@@ -30,6 +30,8 @@ class RoomSession:
     pending_permissions: list[PendingPermission] = field(default_factory=list)
     obsess_goal: str | None = None
     obsess_iteration: int = 0
+    watchdog_recovery_pending: bool = False
+    watchdog_recovery_attempts: int = 0
 
     # Transient event aggregation fields are deliberately not persisted.
     text_parts: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
@@ -38,6 +40,7 @@ class RoomSession:
     activity_history: list[str] = field(default_factory=list, repr=False, compare=False)
     plan_items: list[tuple[str, str]] = field(default_factory=list, repr=False, compare=False)
     stop_requested: bool = field(default=False, repr=False, compare=False)
+    last_activity_ms: int | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +52,8 @@ class RoomSession:
             "pending_permissions": [asdict(value) for value in self.pending_permissions],
             "obsess_goal": self.obsess_goal,
             "obsess_iteration": self.obsess_iteration,
+            "watchdog_recovery_pending": self.watchdog_recovery_pending,
+            "watchdog_recovery_attempts": self.watchdog_recovery_attempts,
         }
 
     @classmethod
@@ -71,6 +76,12 @@ class RoomSession:
                 else None
             ),
             obsess_iteration=int(value.get("obsess_iteration") or 0),
+            watchdog_recovery_pending=bool(
+                value.get("watchdog_recovery_pending", False)
+            ),
+            watchdog_recovery_attempts=int(
+                value.get("watchdog_recovery_attempts") or 0
+            ),
         )
 
 

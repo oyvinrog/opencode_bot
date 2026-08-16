@@ -117,6 +117,16 @@ commands are not posted; user-visible plan descriptions may mention files.
 Permission requests and errors are sent immediately. Replies longer than 20,000
 characters are split at completion.
 
+An in-process watchdog checks active bot-submitted prompts every 30 seconds. If
+OpenCode produces no session, message, tool, plan, retry, or permission activity
+for `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default), the bot aborts the
+stalled turn and continues the unfinished task in the same session. Each repeated
+recovery requires another full silent timeout, and `!stop` cancels automatic
+continuation. Pending permission requests are never interrupted. The watchdog also
+reconciles missed idle events and OpenCode's occasional stale `busy` status by
+requiring a completed timestamp on the latest assistant message before treating a
+busy response as finished.
+
 Set `MATRIX_SHOW_REASONING=true` to also stream the provider-exposed reasoning
 text that OpenCode displays in its thinking view. This text is shown only while
 the response is in progress and is removed when the final answer replaces the
@@ -129,7 +139,8 @@ Room mappings and in-flight Matrix event IDs are stored atomically in
 `data/room_sessions.json` with owner-only permissions. On restart, the bot checks
 that directories are still allowed and that sessions still exist. If a response
 completed while disconnected, it reads recent OpenCode messages and finishes the
-pending Matrix edit.
+pending Matrix edit. Pending watchdog recovery state is also restored; active
+restored prompts receive a fresh full silence window before intervention.
 
 ## Testing and smoke check
 
