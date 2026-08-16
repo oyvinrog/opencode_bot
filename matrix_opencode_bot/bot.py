@@ -296,6 +296,8 @@ class MatrixOpenCodeBot:
         state.last_activity_ms = state.prompt_started_ms
         state.text_parts.clear()
         state.reasoning_parts.clear()
+        state.message_roles.clear()
+        state.part_message_ids.clear()
         state.activity = "starting"
         state.activity_history.clear()
         state.plan_items.clear()
@@ -840,6 +842,7 @@ Return exactly:
                     "last_activity_ms": state.last_activity_ms,
                     "text_parts": state.text_parts,
                     "reasoning_parts": state.reasoning_parts,
+                    "message_roles": state.message_roles,
                     "stop_requested": state.stop_requested,
                 }
                 if state
@@ -1489,17 +1492,40 @@ Return exactly:
             await self.store.save()
             return
 
+        if event_type == "message.updated":
+            info = properties.get("info", {})
+            if not isinstance(info, dict):
+                return
+            message_id = str(info.get("id") or "")
+            role = str(info.get("role") or "")
+            if message_id and role:
+                state.message_roles[message_id] = role
+                if role != "assistant":
+                    for part_id, owner_id in list(state.part_message_ids.items()):
+                        if owner_id == message_id:
+                            state.text_parts.pop(part_id, None)
+                            state.reasoning_parts.pop(part_id, None)
+            return
+
         if event_type == "message.part.updated" and state.in_flight_event_id:
             part = properties.get("part", {})
             if not isinstance(part, dict):
                 return
+            part_id = str(part.get("id") or "")
+            message_id = str(part.get("messageID") or properties.get("messageID") or "")
+            if part_id and message_id:
+                state.part_message_ids[part_id] = message_id
+            if message_id and state.message_roles.get(message_id) not in {None, "assistant"}:
+                state.text_parts.pop(part_id, None)
+                state.reasoning_parts.pop(part_id, None)
+                return
             part_type = part.get("type")
             if part_type == "text" and not part.get("ignored"):
-                state.text_parts[str(part.get("id", len(state.text_parts)))] = str(part.get("text", ""))
+                state.text_parts[part_id or str(len(state.text_parts))] = str(part.get("text", ""))
                 self.schedule_live_edit(room_id, state)
             elif part_type == "reasoning":
                 if self.settings.show_reasoning:
-                    state.reasoning_parts[str(part.get("id", len(state.reasoning_parts)))] = (
+                    state.reasoning_parts[part_id or str(len(state.reasoning_parts))] = (
                         str(part.get("text", ""))
                     )
                 self._set_activity(state, "Reasoning")
@@ -1758,6 +1784,8 @@ Return exactly:
         state.prompt_started_ms = None
         state.text_parts.clear()
         state.reasoning_parts.clear()
+        state.message_roles.clear()
+        state.part_message_ids.clear()
         state.activity = None
         state.activity_history.clear()
         state.plan_items.clear()

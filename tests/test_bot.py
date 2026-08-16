@@ -413,6 +413,93 @@ async def test_bare_verifier_json_is_accepted_when_it_is_the_entire_response(
     assert opencode.prompt_async.await_args.args[0] == "ses_pursue"
 
 
+async def test_verifier_prompt_text_is_not_combined_with_assistant_contract(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_old", str(tmp_path))
+    opencode.create_session.side_effect = [
+        {"id": "ses_pursue"},
+        {"id": "ses_verify"},
+    ]
+    await bot.command_pursue("!one:example", "Research current jobs")
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "ses_verify",
+                "info": {"id": "msg_user", "role": "user"},
+            },
+        },
+    })
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_verify",
+                "part": {
+                    "id": "prompt",
+                    "messageID": "msg_user",
+                    "sessionID": "ses_verify",
+                    "type": "text",
+                    "text": (
+                        'Return <pursuit-control>{"criteria":["<criterion>"]}'
+                        "</pursuit-control>"
+                    ),
+                },
+            },
+        },
+    })
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "ses_verify",
+                "info": {"id": "msg_assistant", "role": "assistant"},
+            },
+        },
+    })
+    contract = {
+        "type": "contract",
+        "criteria": ["Every listed role is currently open and located in Oslo"],
+        "assumptions": [],
+        "needs_input": False,
+        "question": None,
+    }
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "ses_verify",
+                "part": {
+                    "id": "answer",
+                    "messageID": "msg_assistant",
+                    "sessionID": "ses_verify",
+                    "type": "text",
+                    "text": f"<pursuit-control>{json.dumps(contract)}</pursuit-control>",
+                },
+            },
+        },
+    })
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "session.idle",
+            "properties": {"sessionID": "ses_verify"},
+        },
+    })
+
+    state = store.rooms["!one:example"]
+    assert state.pursuit_phase == "working"
+    assert state.pursuit_protocol_failures == 0
+    assert state.acceptance_criteria == contract["criteria"]
+
+
 async def test_placeholder_acceptance_contract_is_rejected(tmp_path: Path) -> None:
     bot, _, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_old", str(tmp_path))
