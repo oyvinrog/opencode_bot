@@ -122,13 +122,32 @@ class OpenCodeClient:
         result = await self._request("GET", "/session/status", directory=directory)
         return result if isinstance(result, dict) else {}
 
-    async def prompt_async(self, session_id: str, directory: str, text: str) -> None:
+    async def prompt_async(
+        self,
+        session_id: str,
+        directory: str,
+        text: str,
+        *,
+        system: str | None = None,
+        tools: dict[str, bool] | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
+        if system:
+            body["system"] = system
+        if tools:
+            body["tools"] = tools
         await self._request(
             "POST",
             f"/session/{quote(session_id, safe='')}/prompt_async",
             directory=directory,
-            body={"parts": [{"type": "text", "text": text}]},
+            body=body,
         )
+
+    async def delete_session(self, session_id: str, directory: str) -> bool:
+        result = await self._request(
+            "DELETE", f"/session/{quote(session_id, safe='')}", directory=directory
+        )
+        return bool(result)
 
     async def messages(
         self, session_id: str, directory: str, limit: int = 20

@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from matrix_opencode_bot.bot import MatrixOpenCodeBot, render_diffs, split_text
 from matrix_opencode_bot.config import Settings
+from matrix_opencode_bot.opencode import OpenCodeError
 from matrix_opencode_bot.state import PendingPermission, RoomSession, StateStore
 
 
@@ -44,6 +46,7 @@ def make_bot(tmp_path: Path, *, show_reasoning: bool = False):
         diff=AsyncMock(return_value=[]),
         reply_permission=AsyncMock(return_value=True),
         abort=AsyncMock(return_value=True),
+        delete_session=AsyncMock(return_value=True),
         messages=AsyncMock(return_value=[]),
         get_session=AsyncMock(return_value={"id": "ses_1", "title": "Matrix"}),
     )
@@ -62,6 +65,38 @@ def message(bot: MatrixOpenCodeBot, body: str, sender: str = "@alice:example"):
 
 def room(room_id: str = "!one:example"):
     return SimpleNamespace(room_id=room_id, encrypted=True)
+
+
+async def pursuit_text_and_idle(
+    bot: MatrixOpenCodeBot, tmp_path: Path, session_id: str, text: str
+) -> None:
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "answer", "sessionID": session_id,
+                    "type": "text", "text": text,
+                }
+            },
+        },
+    })
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {"type": "session.idle", "properties": {"sessionID": session_id}},
+    })
+
+
+async def pursuit_response(
+    bot: MatrixOpenCodeBot, tmp_path: Path, session_id: str, payload: dict[str, object]
+) -> None:
+    await pursuit_text_and_idle(
+        bot,
+        tmp_path,
+        session_id,
+        f"<pursuit-control>{json.dumps(payload)}</pursuit-control>",
+    )
 
 
 async def test_unauthorized_sender_is_ignored(tmp_path: Path) -> None:
@@ -122,67 +157,260 @@ async def test_new_session_includes_command_reminder(tmp_path: Path) -> None:
     body = matrix.room_send.await_args.kwargs["content"]["body"]
     assert "Commands:" in body
     assert "!new [directory]" in body
-    assert "!obsess <goal>" in body
+    assert "!pursue <goal>" in body
+    assert "!obsess" not in body
 
 
-async def test_obsess_repeats_goal_after_each_idle_event(tmp_path: Path) -> None:
+async def test_removed_obsess_command_is_rejected(tmp_path: Path) -> None:
+    bot, matrix, opencode, _ = make_bot(tmp_path)
+    await bot.on_message(room(), message(bot, "!obsess old behavior"))
+    assert "Unknown command" in matrix.room_send.await_args.kwargs["content"]["body"]
+    opencode.create_session.assert_not_awaited()
+
+
+async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> None:
     bot, matrix, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+    opencode.create_session.return_value = {"id": "ses_verify", "title": "Verifier"}
 
-    await bot.command_obsess("!one:example", "Find the root cause")
+    await bot.command_pursue("!one:example", "Find the root cause")
 
     state = store.rooms["!one:example"]
-    assert state.obsess_goal == "Find the root cause"
-    assert state.obsess_iteration == 1
-    assert "Find the root cause" in opencode.prompt_async.await_args.args[2]
+    assert state.pursuit_goal == "Find the root cause"
+    assert state.pursuit_phase == "specifying"
+    assert opencode.prompt_async.await_args.args[0] == "ses_verify"
+    assert "authoritative or primary sources" in opencode.prompt_async.await_args.kwargs["system"]
+    assert opencode.prompt_async.await_args.kwargs["tools"]["write"] is False
 
-    await bot.handle_opencode_event({
-        "directory": str(tmp_path),
-        "payload": {"type": "session.idle", "properties": {"sessionID": "ses_1"}},
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "contract",
+        "criteria": ["The root cause is demonstrated with evidence"],
+        "assumptions": ["Use the current workspace"],
+        "needs_input": False,
+        "question": None,
     })
+    assert state.pursuit_phase == "working"
+    assert state.pursuit_iteration == 1
+    assert opencode.prompt_async.await_args.args[0] == "ses_1"
 
-    assert opencode.prompt_async.await_count == 2
-    assert "Continue pursuing" in opencode.prompt_async.await_args.args[2]
-    assert "Find the root cause" in opencode.prompt_async.await_args.args[2]
-    assert state.obsess_iteration == 2
-    assert state.in_flight_event_id is not None
-    assert "pass 2" in matrix.room_send.await_args.kwargs["content"]["body"]
+    await pursuit_text_and_idle(bot, tmp_path, "ses_1", "The bug is in parser X.")
+    assert state.pursuit_phase == "verifying"
+    assert opencode.prompt_async.await_args.args[0] == "ses_verify"
+
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "verdict",
+        "verdict": "complete",
+        "criteria": [{
+            "criterion": "The root cause is demonstrated with evidence",
+            "status": "pass",
+            "evidence": "Independent inspection confirms parser X",
+        }],
+        "evidence": ["Independent inspection confirms parser X"],
+        "feedback": "",
+        "gap": "",
+        "question": None,
+    })
+    assert state.pursuit_goal is None
+    opencode.delete_session.assert_awaited_once_with("ses_verify", str(tmp_path))
+    final = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
+    assert "Pursuit complete" in final
 
 
-async def test_stop_clears_obsession_before_aborting(tmp_path: Path) -> None:
+async def test_stop_clears_pursuit_before_aborting(tmp_path: Path) -> None:
     bot, _, opencode, store = make_bot(tmp_path)
     state = RoomSession(
         "ses_1",
         str(tmp_path),
         in_flight_event_id="$event",
-        obsess_goal="Keep looking",
-        obsess_iteration=4,
+        pursuit_goal="Keep looking",
+        pursuit_phase="working",
+        pursuit_iteration=4,
+        verifier_session_id="ses_verify",
     )
     store.rooms["!one:example"] = state
     opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
 
     await bot.command_stop("!one:example")
 
-    assert state.obsess_goal is None
-    assert state.obsess_iteration == 0
+    assert state.pursuit_goal is None
+    assert state.pursuit_iteration == 0
     opencode.abort.assert_awaited_once_with("ses_1", str(tmp_path))
+    opencode.delete_session.assert_awaited_once_with("ses_verify", str(tmp_path))
 
 
-async def test_persisted_idle_obsession_resumes(tmp_path: Path) -> None:
+async def test_persisted_idle_pursuit_resumes(tmp_path: Path) -> None:
     bot, _, opencode, store = make_bot(tmp_path)
     state = RoomSession(
         "ses_1",
         str(tmp_path),
-        obsess_goal="Keep investigating",
-        obsess_iteration=2,
+        pursuit_goal="Keep investigating",
+        pursuit_phase="working",
+        pursuit_iteration=2,
+        acceptance_criteria=["Find reliable evidence"],
     )
     store.rooms["!one:example"] = state
 
-    await bot.resume_obsessions()
+    await bot.resume_pursuits()
 
-    assert state.obsess_iteration == 3
+    assert state.pursuit_iteration == 3
     assert state.in_flight_event_id is not None
     assert "Keep investigating" in opencode.prompt_async.await_args.args[2]
+
+
+async def test_pursuit_pauses_for_material_input_and_normal_reply_resumes(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+    opencode.create_session.return_value = {"id": "ses_verify"}
+    await bot.command_pursue("!one:example", "Find a suitable product")
+
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "contract",
+        "criteria": ["The product matches the user's required region"],
+        "assumptions": [],
+        "needs_input": True,
+        "question": "Which country should availability be checked in?",
+    })
+    state = store.rooms["!one:example"]
+    assert state.pursuit_phase == "waiting_input"
+
+    await bot.prompt("!one:example", "Norway")
+    assert state.pursuit_phase == "working"
+    assert "User clarification: Norway" in state.pursuit_assumptions
+    assert opencode.prompt_async.await_args.args[0] == "ses_1"
+
+
+async def test_verifier_continue_records_feedback_and_replans(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        pursuit_goal="Research the claim",
+        pursuit_phase="verifying",
+        pursuit_iteration=1,
+        verifier_session_id="ses_verify",
+        acceptance_criteria=["The claim is supported by a current primary source"],
+        pursuit_last_worker_report="A blog repeats the claim.",
+        in_flight_event_id="$verify",
+    )
+    store.rooms["!one:example"] = state
+
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "verdict",
+        "verdict": "continue",
+        "criteria": [{
+            "criterion": "The claim is supported by a current primary source",
+            "status": "unknown",
+            "evidence": "Only a secondary blog was found",
+        }],
+        "evidence": [],
+        "feedback": "Search the issuing authority's records and check contrary sources.",
+        "gap": "No primary source",
+        "question": None,
+    })
+    assert state.pursuit_phase == "working"
+    assert state.pursuit_iteration == 2
+    assert state.pursuit_gap == "No primary source"
+    assert "issuing authority" in state.pursuit_reflections[-1]
+    assert "issuing authority" in opencode.prompt_async.await_args.args[2]
+    verifier_edit = matrix.room_send.await_args_list[-2].kwargs["content"]["m.new_content"]["body"]
+    assert "Verifier: continue" in verifier_edit
+
+
+async def test_invalid_verifier_envelope_is_hidden_and_repaired(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+    opencode.create_session.return_value = {"id": "ses_verify"}
+    await bot.command_pursue("!one:example", "Research carefully")
+
+    await pursuit_text_and_idle(bot, tmp_path, "ses_verify", "not valid control JSON")
+    state = store.rooms["!one:example"]
+    assert state.pursuit_protocol_failures == 1
+    assert state.pursuit_phase == "specifying"
+    assert "prior response did not match" in opencode.prompt_async.await_args.args[2]
+    visible = matrix.room_send.await_args_list[-2].kwargs["content"]["m.new_content"]["body"]
+    assert "not valid control JSON" not in visible
+
+
+async def test_three_identical_evidence_free_gaps_reset_worker_context(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        pursuit_goal="Find the record",
+        pursuit_phase="verifying",
+        pursuit_iteration=1,
+        verifier_session_id="ses_verify",
+        acceptance_criteria=["Locate the authoritative record"],
+        pursuit_last_worker_report="No result",
+        in_flight_event_id="$verify",
+    )
+    store.rooms["!one:example"] = state
+    opencode.create_session.return_value = {"id": "ses_reset", "title": "Reset"}
+    verdict = {
+        "type": "verdict",
+        "verdict": "continue",
+        "criteria": [{
+            "criterion": "Locate the authoritative record",
+            "status": "unknown",
+            "evidence": "No authoritative record located",
+        }],
+        "evidence": [],
+        "feedback": "Change search vocabulary and database.",
+        "gap": "Authoritative record not located",
+        "question": None,
+    }
+
+    for index in range(3):
+        await pursuit_response(bot, tmp_path, "ses_verify", verdict)
+        if index < 2:
+            await pursuit_text_and_idle(bot, tmp_path, "ses_1", "Still no result")
+
+    assert state.session_id == "ses_reset"
+    assert state.pursuit_stagnation_count == 0
+    assert "fresh strategy context" in opencode.prompt_async.await_args.args[2]
+
+
+async def test_status_reports_pursuit_progress_and_pending_question(tmp_path: Path) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        pursuit_goal="Answer a question",
+        pursuit_phase="waiting_input",
+        pursuit_iteration=2,
+        acceptance_criteria=["A", "B"],
+        pursuit_criteria_status={"A": "pass", "B": "unknown"},
+        pursuit_evidence=["Primary source confirms A"],
+        pursuit_gap="B remains unknown",
+        pursuit_pending_question="Which date range?",
+    )
+    await bot.command_status("!one:example")
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "Pursuit: waiting_input, pass 2" in body
+    assert "Acceptance: 1/2" in body
+    assert "Which date range?" in body
+
+
+async def test_pursuit_submission_error_retries_with_backoff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+    opencode.create_session.return_value = {"id": "ses_verify"}
+    opencode.prompt_async.side_effect = [OpenCodeError("offline"), None]
+    sleep = AsyncMock()
+    monkeypatch.setattr("matrix_opencode_bot.bot.asyncio.sleep", sleep)
+
+    await bot.command_pursue("!one:example", "Keep trying")
+    await bot.retry_tasks["!one:example"]
+
+    assert opencode.prompt_async.await_count == 2
+    sleep.assert_awaited_once_with(1)
+    assert store.rooms["!one:example"].pursuit_retry_attempts == 0
 
 
 async def test_busy_prompt_is_rejected(tmp_path: Path) -> None:

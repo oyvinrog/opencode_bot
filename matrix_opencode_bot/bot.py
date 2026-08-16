@@ -10,6 +10,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import stat
 import time
 from collections import defaultdict
@@ -41,20 +42,32 @@ WATCHDOG_CONTINUATION = (
     "session context. First inspect the current state, preserve completed work, and avoid "
     "repeating completed or side-effectful actions."
 )
+CONTROL_PATTERN = re.compile(
+    r"<pursuit-control>\s*(\{.*?\})\s*</pursuit-control>", re.DOTALL
+)
+VERIFIER_SYSTEM = """You are an independent, evidence-driven verifier. Do not edit files,
+delegate work, or perform consequential actions. You may inspect files, run non-mutating checks,
+and search/fetch the web. Prefer objective external evidence over the worker's assertions. For web
+research, check identity, relevance, recency, authoritative or primary sources, claim coverage, and
+contradictory evidence; one decisive primary source can be sufficient. For code, independently
+inspect state and run applicable checks. For qualitative work, use the frozen rubric and distinguish
+facts from inference. Difficulty is not a reason to stop. Return exactly one tagged JSON control
+envelope in the requested schema and no text outside it."""
+VERIFIER_TOOLS = {"write": False, "edit": False, "apply_patch": False, "task": False}
 
 HELP = """Matrix–OpenCode commands:
 !new [directory] — start a session
 Ordinary messages — prompt the current session, creating one if needed
-!obsess <goal> — keep pursuing a goal until !stop
+!pursue <goal> — pursue a goal until independently verified or !stop
 !status — show current activity
 !allow / !deny — answer the oldest permission request
 !diff — show changed files
-!stop — stop an obsession and abort the current operation
+!stop — stop a pursuit and abort the current operation
 !reset — discard the room-to-session mapping
 !help — show this message"""
 
 SESSION_REMINDER = (
-    "Commands: !new [directory], !obsess <goal>, !status, !diff, !allow, !deny, "
+    "Commands: !new [directory], !pursue <goal>, !status, !diff, !allow, !deny, "
     "!stop, !reset, !help"
 )
 
@@ -75,6 +88,7 @@ class MatrixOpenCodeBot:
         self.stop_events = asyncio.Event()
         self.room_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.edit_tasks: dict[str, asyncio.Task[None]] = {}
+        self.retry_tasks: dict[str, asyncio.Task[None]] = {}
         self.last_edit: dict[str, float] = {}
         self.watchdog_task: asyncio.Task[None] | None = None
 
@@ -121,8 +135,8 @@ class MatrixOpenCodeBot:
                 await self.command_new(room_id, argument.strip() or None)
             elif command == "!status":
                 await self.command_status(room_id)
-            elif command == "!obsess":
-                await self.command_obsess(room_id, argument.strip())
+            elif command == "!pursue":
+                await self.command_pursue(room_id, argument.strip())
             elif command == "!allow":
                 await self.command_permission(room_id, "once")
             elif command == "!deny":
@@ -141,15 +155,23 @@ class MatrixOpenCodeBot:
             LOG.warning("OpenCode command failed in %s: %s", room_id, exc)
             await self.send_text(room_id, f"OpenCode error: {exc}")
 
-    async def _status(self, state: RoomSession) -> dict[str, Any]:
+    @staticmethod
+    def _active_session_id(state: RoomSession) -> str:
+        if state.pursuit_phase in {"specifying", "verifying"} and state.verifier_session_id:
+            return state.verifier_session_id
+        return state.session_id
+
+    async def _status(
+        self, state: RoomSession, session_id: str | None = None
+    ) -> dict[str, Any]:
         statuses = await self.opencode.session_status(state.directory)
-        status = statuses.get(state.session_id, {"type": "idle"})
+        status = statuses.get(session_id or self._active_session_id(state), {"type": "idle"})
         return status if isinstance(status, dict) else {"type": "unknown"}
 
     async def command_new(self, room_id: str, requested: str | None) -> None:
         current = self.store.rooms.get(room_id)
         if current and (
-            current.obsess_goal
+            current.pursuit_goal
             or current.in_flight_event_id
             or (await self._status(current)).get("type") != "idle"
         ):
@@ -190,8 +212,11 @@ class MatrixOpenCodeBot:
             except ValueError as exc:
                 await self.send_text(room_id, f"Cannot automatically start session: {exc}")
                 return
+        if state.pursuit_goal and state.pursuit_phase == "waiting_input":
+            await self._resume_pursuit_with_input(room_id, state, text)
+            return
         status = await self._status(state)
-        if state.obsess_goal or state.in_flight_event_id or status.get("type") != "idle":
+        if state.pursuit_goal or state.in_flight_event_id or status.get("type") != "idle":
             await self.send_text(room_id, "This session is busy. Wait for it to finish or use !stop.")
             return
 
@@ -206,14 +231,23 @@ class MatrixOpenCodeBot:
         state.watchdog_recovery_attempts = 0
         await self._submit_prompt(room_id, state, text)
 
-    async def _submit_prompt(self, room_id: str, state: RoomSession, text: str) -> bool:
+    async def _submit_prompt(
+        self,
+        room_id: str,
+        state: RoomSession,
+        text: str,
+        *,
+        session_id: str | None = None,
+        system: str | None = None,
+        tools: dict[str, bool] | None = None,
+    ) -> bool:
         """Submit one pass after the caller has established that the session is idle."""
 
-        label = (
-            f"Obsessing… pass {state.obsess_iteration}"
-            if state.obsess_goal
-            else "Working…"
-        )
+        if state.pursuit_goal:
+            phase = (state.pursuit_phase or "working").replace("ing", "")
+            label = f"Pursuing… {phase}, pass {state.pursuit_iteration}"
+        else:
+            label = "Working…"
         event_id = await self.send_text(room_id, label)
         if not event_id:
             LOG.error("Not submitting prompt because the Matrix progress message could not be sent")
@@ -229,17 +263,43 @@ class MatrixOpenCodeBot:
         state.stop_requested = False
         await self.store.save()
         try:
-            await self.opencode.prompt_async(state.session_id, state.directory, text)
+            target = session_id or state.session_id
+            if system or tools:
+                await self.opencode.prompt_async(
+                    target, state.directory, text, system=system, tools=tools
+                )
+            else:
+                await self.opencode.prompt_async(target, state.directory, text)
         except OpenCodeError as exc:
             await self.send_edit(room_id, event_id, f"OpenCode error: {exc}")
             self._clear_in_flight(state)
+            if state.pursuit_goal:
+                state.pursuit_retry_attempts += 1
+                self._schedule_pursuit_retry(room_id, state)
             await self.store.save()
             return False
+        if state.pursuit_retry_attempts:
+            state.pursuit_retry_attempts = 0
+            await self.store.save()
         return True
 
-    async def command_obsess(self, room_id: str, goal: str) -> None:
+    def _schedule_pursuit_retry(self, room_id: str, state: RoomSession) -> None:
+        current = self.retry_tasks.get(room_id)
+        if current and not current.done():
+            return
+        delay = min(30, 2 ** min(state.pursuit_retry_attempts - 1, 5))
+
+        async def retry() -> None:
+            await asyncio.sleep(delay)
+            async with self.room_locks[room_id]:
+                if state.pursuit_goal and not state.in_flight_event_id:
+                    await self._resume_pursuit_phase(room_id, state)
+
+        self.retry_tasks[room_id] = asyncio.create_task(retry())
+
+    async def command_pursue(self, room_id: str, goal: str) -> None:
         if not goal:
-            await self.send_text(room_id, "Usage: !obsess <goal>")
+            await self.send_text(room_id, "Usage: !pursue <goal>")
             return
         state = self.store.rooms.get(room_id)
         created = state is None
@@ -249,14 +309,24 @@ class MatrixOpenCodeBot:
             except ValueError as exc:
                 await self.send_text(room_id, f"Cannot automatically start session: {exc}")
                 return
+        if state.pursuit_goal:
+            await self.send_text(
+                room_id, "A pursuit is already active. Use !stop before starting another."
+            )
+            return
         status = await self._status(state)
         if state.in_flight_event_id or status.get("type") != "idle":
             await self.send_text(room_id, "This session is busy. Wait for it to finish or use !stop.")
             return
+        verifier = await self.opencode.create_session(
+            state.directory, title="Matrix pursuit verifier"
+        )
+        self._clear_pursuit(state)
         state.watchdog_recovery_pending = False
         state.watchdog_recovery_attempts = 0
-        state.obsess_goal = goal
-        state.obsess_iteration = 1
+        state.pursuit_goal = goal
+        state.pursuit_phase = "specifying"
+        state.verifier_session_id = str(verifier["id"])
         await self.store.save()
         if created:
             await self.send_text(
@@ -264,31 +334,307 @@ class MatrixOpenCodeBot:
                 f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}"
                 f"\n\n{SESSION_REMINDER}",
             )
-        await self._submit_prompt(room_id, state, self._obsess_prompt(state))
+        await self._submit_verifier(room_id, state, self._specification_prompt(state))
 
-    @staticmethod
-    def _obsess_prompt(state: RoomSession) -> str:
-        goal = state.obsess_goal or ""
-        if state.obsess_iteration <= 1:
-            return (
-                f"Pursue this ongoing goal in this pass: {goal}\n\n"
-                "This is an ongoing loop. Make concrete progress in this pass and report what "
-                "you found or accomplished. The loop will ask you to continue until the user "
-                "sends !stop."
+    async def _submit_verifier(
+        self, room_id: str, state: RoomSession, prompt: str
+    ) -> bool:
+        if not state.verifier_session_id:
+            verifier = await self.opencode.create_session(
+                state.directory, title="Matrix pursuit verifier"
             )
-        return (
-            f"Continue pursuing this ongoing goal: {goal}\n\n"
-            "Review the prior passes in this session, then make further concrete progress. "
-            "Investigate a useful new angle, verify unresolved assumptions, and do not merely "
-            "repeat the previous response. The user will send !stop when the loop should end."
+            state.verifier_session_id = str(verifier["id"])
+            await self.store.save()
+        return await self._submit_prompt(
+            room_id,
+            state,
+            prompt,
+            session_id=state.verifier_session_id,
+            system=VERIFIER_SYSTEM,
+            tools=VERIFIER_TOOLS,
         )
 
-    async def _continue_obsession(self, room_id: str, state: RoomSession) -> None:
-        if not state.obsess_goal:
+    @staticmethod
+    def _specification_prompt(state: RoomSession) -> str:
+        clarification = "\n".join(state.pursuit_assumptions[-5:]) or "None"
+        return f"""Define a stable acceptance contract for this goal:
+
+{state.pursuit_goal}
+
+User clarifications already received:
+{clarification}
+
+Infer harmless details. Ask for input only if a missing fact would materially change the result.
+Return exactly:
+<pursuit-control>{{"type":"contract","criteria":["specific mandatory criterion"],"assumptions":["assumption"],"needs_input":false,"question":null}}</pursuit-control>
+Criteria must be task-aware and objectively checkable where possible. Do not perform the task yet."""
+
+    @staticmethod
+    def _worker_prompt(state: RoomSession, *, reset: bool = False) -> str:
+        criteria = "\n".join(f"- {item}" for item in state.acceptance_criteria)
+        assumptions = "\n".join(f"- {item}" for item in state.pursuit_assumptions) or "- None"
+        reflections = "\n".join(f"- {item}" for item in state.pursuit_reflections[-6:]) or "- None"
+        evidence = "\n".join(f"- {item}" for item in state.pursuit_evidence[-8:]) or "- None"
+        reset_text = (
+            "This is a fresh strategy context after stagnation. Do not repeat failed approaches."
+            if reset
+            else "Continue from the existing session state."
+        )
+        return f"""Pursue this goal and make concrete progress in this pass:
+
+{state.pursuit_goal}
+
+Frozen mandatory acceptance criteria:
+{criteria}
+
+Assumptions and user clarifications:
+{assumptions}
+
+Verified evidence so far:
+{evidence}
+
+Verifier feedback and failed approaches:
+{reflections}
+
+Current unresolved gap: {state.pursuit_gap or "Start with the highest-value unresolved criterion."}
+{reset_text}
+
+Act, observe real tool or source feedback, and verify your own work. Do not declare the overall
+goal complete; the separate verifier decides that. End with a concise report containing actions,
+new evidence, unresolved gaps, and failures. For research, include direct source URLs and separate
+sourced facts from inference."""
+
+    @staticmethod
+    def _verification_prompt(state: RoomSession) -> str:
+        criteria = "\n".join(f"- {item}" for item in state.acceptance_criteria)
+        assumptions = "\n".join(f"- {item}" for item in state.pursuit_assumptions) or "- None"
+        prior_evidence = "\n".join(f"- {item}" for item in state.pursuit_evidence[-12:]) or "- None"
+        prior_feedback = "\n".join(f"- {item}" for item in state.pursuit_reflections[-6:]) or "- None"
+        return f"""Independently evaluate the latest worker pass against the frozen contract.
+
+Goal: {state.pursuit_goal}
+
+Mandatory criteria:
+{criteria}
+
+Assumptions and user clarifications:
+{assumptions}
+
+Previously verified evidence:
+{prior_evidence}
+
+Prior verifier feedback:
+{prior_feedback}
+
+Worker report (claims are not evidence until independently checked):
+{state.pursuit_last_worker_report or "No report was recovered."}
+
+Use available read-only tools and external sources to check material claims. `complete` is valid only
+when every mandatory criterion passes with concrete evidence. Repeat each frozen criterion's text
+exactly in the criteria array. Use `needs_input` only for a material
+user fact or action; difficulty means `continue`.
+Return exactly:
+<pursuit-control>{{"type":"verdict","verdict":"complete|continue|needs_input","criteria":[{{"criterion":"...","status":"pass|fail|unknown","evidence":"..."}}],"evidence":["new verified evidence"],"feedback":"specific next strategy","gap":"most important unresolved gap or empty","question":null}}</pursuit-control>"""
+
+    async def _resume_pursuit_with_input(
+        self, room_id: str, state: RoomSession, text: str
+    ) -> None:
+        state.pursuit_assumptions.append(f"User clarification: {text}")
+        del state.pursuit_assumptions[:-12]
+        state.pursuit_pending_question = None
+        if state.acceptance_criteria:
+            state.pursuit_phase = "working"
+            state.pursuit_iteration += 1
+            await self.store.save()
+            await self._submit_prompt(room_id, state, self._worker_prompt(state))
+        else:
+            state.pursuit_phase = "specifying"
+            await self.store.save()
+            await self._submit_verifier(room_id, state, self._specification_prompt(state))
+
+    async def _handle_pursuit_idle(
+        self, room_id: str, state: RoomSession, raw: str
+    ) -> None:
+        phase = state.pursuit_phase
+        if phase == "working":
+            state.pursuit_last_worker_report = raw[-16_000:]
+            await self.finalize(room_id, state, raw)
+            if not state.acceptance_criteria:
+                state.pursuit_phase = "specifying"
+                await self.store.save()
+                await self._submit_verifier(room_id, state, self._specification_prompt(state))
+                return
+            state.pursuit_phase = "verifying"
+            await self.store.save()
+            await self._submit_verifier(room_id, state, self._verification_prompt(state))
             return
-        state.obsess_iteration += 1
+
+        control = _parse_pursuit_control(raw, phase)
+        if control is None:
+            await self._repair_pursuit_protocol(room_id, state, raw)
+            return
+        state.pursuit_protocol_failures = 0
+
+        if phase == "specifying":
+            state.acceptance_criteria = control["criteria"]
+            state.pursuit_assumptions.extend(control["assumptions"])
+            state.pursuit_assumptions = state.pursuit_assumptions[-12:]
+            if control["needs_input"]:
+                question = control["question"]
+                state.pursuit_phase = "waiting_input"
+                state.pursuit_pending_question = question
+                await self.finalize(room_id, state, f"Pursuit needs input: {question}")
+                return
+            state.pursuit_phase = "working"
+            state.pursuit_iteration = max(1, state.pursuit_iteration + 1)
+            summary = "Acceptance contract:\n" + "\n".join(
+                f"- {item}" for item in state.acceptance_criteria
+            )
+            await self.finalize(room_id, state, summary)
+            await self._submit_prompt(room_id, state, self._worker_prompt(state))
+            return
+
+        verdict = control["verdict"]
+        new_evidence = control["evidence"] + [
+            item["evidence"]
+            for item in control["criteria"]
+            if item["status"] == "pass" and item["evidence"]
+        ]
+        new_evidence = list(dict.fromkeys(new_evidence))
+        state.pursuit_criteria_status = {
+            item["criterion"]: item["status"] for item in control["criteria"]
+        }
+        state.pursuit_evidence.extend(new_evidence)
+        state.pursuit_evidence = state.pursuit_evidence[-16:]
+        if verdict == "complete":
+            passed = all(
+                item["status"] == "pass" and bool(item["evidence"])
+                for item in control["criteria"]
+            )
+            exact_contract = {
+                item["criterion"] for item in control["criteria"]
+            } == set(state.acceptance_criteria)
+            if not passed or not exact_contract:
+                verdict = "continue"
+                control["feedback"] = (
+                    "Completion rejected: repeat every frozen criterion exactly and provide "
+                    "passing evidence for each one."
+                )
+
+        if verdict == "complete":
+            completion_evidence = new_evidence or [
+                item["evidence"] for item in control["criteria"] if item["evidence"]
+            ]
+            evidence_text = "\n".join(f"- {item}" for item in completion_evidence)
+            final = f"✅ Pursuit complete after {state.pursuit_iteration} pass(es).\nEvidence:\n{evidence_text}"
+            await self.finalize(room_id, state, final)
+            await self._finish_pursuit(state)
+            await self.store.save()
+            return
+
+        if verdict == "needs_input":
+            question = control["question"]
+            state.pursuit_phase = "waiting_input"
+            state.pursuit_pending_question = question
+            await self.finalize(room_id, state, f"Pursuit needs input: {question}")
+            return
+
+        feedback = control["feedback"] or "Try a materially different approach."
+        state.pursuit_reflections.append(feedback)
+        state.pursuit_reflections = state.pursuit_reflections[-10:]
+        state.pursuit_gap = control["gap"] or "Unmet acceptance criteria remain."
+        signature = "|".join(
+            sorted(item["criterion"] for item in control["criteria"] if item["status"] != "pass")
+        ) + "|" + state.pursuit_gap
+        if new_evidence:
+            state.pursuit_signature = signature
+            state.pursuit_stagnation_count = 0
+        elif signature == state.pursuit_signature:
+            state.pursuit_stagnation_count += 1
+        else:
+            state.pursuit_signature = signature
+            state.pursuit_stagnation_count = 1
+        reset = state.pursuit_stagnation_count >= 3
+        await self.finalize(
+            room_id,
+            state,
+            f"Verifier: continue.\nGap: {state.pursuit_gap}\nNext strategy: {feedback}",
+        )
+        if reset:
+            worker = await self.opencode.create_session(
+                state.directory, title="Matrix OpenCode pursuit (strategy reset)"
+            )
+            state.session_id = str(worker["id"])
+            state.title = str(worker.get("title") or state.title)
+            state.pursuit_stagnation_count = 0
+            state.pursuit_signature = None
+        state.pursuit_phase = "working"
+        state.pursuit_iteration += 1
         await self.store.save()
-        await self._submit_prompt(room_id, state, self._obsess_prompt(state))
+        await self._submit_prompt(room_id, state, self._worker_prompt(state, reset=reset))
+
+    async def _repair_pursuit_protocol(
+        self, room_id: str, state: RoomSession, raw: str
+    ) -> None:
+        state.pursuit_protocol_failures += 1
+        phase = state.pursuit_phase
+        await self.finalize(
+            room_id,
+            state,
+            f"Verifier returned an invalid control envelope; repairing format "
+            f"({state.pursuit_protocol_failures}/3).",
+        )
+        if state.pursuit_protocol_failures >= 3:
+            await self._replace_verifier(state)
+            state.pursuit_protocol_failures = 0
+            prompt = (
+                self._specification_prompt(state)
+                if phase == "specifying"
+                else self._verification_prompt(state)
+            )
+        else:
+            prompt = (
+                "Your prior response did not match the required schema. Return only the exact "
+                "tagged JSON envelope requested previously. Invalid response follows:\n" + raw[-4000:]
+            )
+        await self.store.save()
+        await self._submit_verifier(room_id, state, prompt)
+
+    async def _replace_verifier(self, state: RoomSession) -> None:
+        old = state.verifier_session_id
+        if old:
+            with contextlib.suppress(OpenCodeError):
+                await self.opencode.delete_session(old, state.directory)
+        verifier = await self.opencode.create_session(
+            state.directory, title="Matrix pursuit verifier"
+        )
+        state.verifier_session_id = str(verifier["id"])
+
+    async def _finish_pursuit(self, state: RoomSession) -> None:
+        verifier = state.verifier_session_id
+        self._clear_pursuit(state)
+        if verifier:
+            with contextlib.suppress(OpenCodeError):
+                await self.opencode.delete_session(verifier, state.directory)
+
+    @staticmethod
+    def _clear_pursuit(state: RoomSession) -> None:
+        state.pursuit_goal = None
+        state.pursuit_phase = None
+        state.pursuit_iteration = 0
+        state.verifier_session_id = None
+        state.acceptance_criteria.clear()
+        state.pursuit_criteria_status.clear()
+        state.pursuit_assumptions.clear()
+        state.pursuit_reflections.clear()
+        state.pursuit_evidence.clear()
+        state.pursuit_gap = None
+        state.pursuit_stagnation_count = 0
+        state.pursuit_signature = None
+        state.pursuit_pending_question = None
+        state.pursuit_protocol_failures = 0
+        state.pursuit_retry_attempts = 0
+        state.pursuit_last_worker_report = None
 
     async def command_status(self, room_id: str) -> None:
         state = self.store.rooms.get(room_id)
@@ -314,8 +660,30 @@ class MatrixOpenCodeBot:
             )
         elif state.watchdog_recovery_attempts:
             lines.append(f"Watchdog recoveries: {state.watchdog_recovery_attempts}")
-        if state.obsess_goal:
-            lines.append(f"Obsessing: pass {state.obsess_iteration} — {state.obsess_goal}")
+        if state.pursuit_goal:
+            passed = sum(
+                1 for status_value in state.pursuit_criteria_status.values()
+                if status_value == "pass"
+            )
+            lines.append(
+                f"Pursuit: {state.pursuit_phase}, pass {state.pursuit_iteration} — "
+                f"{state.pursuit_goal}"
+            )
+            lines.append(
+                f"Acceptance: {passed}/{len(state.acceptance_criteria)} evidenced; "
+                f"stagnation {state.pursuit_stagnation_count}/3"
+            )
+            if state.pursuit_gap:
+                lines.append(f"Current gap: {state.pursuit_gap}")
+            if state.pursuit_evidence:
+                lines.append(f"Latest evidence: {state.pursuit_evidence[-1]}")
+            if state.pursuit_pending_question:
+                lines.append(f"Waiting for input: {state.pursuit_pending_question}")
+            if state.pursuit_retry_attempts:
+                lines.append(
+                    f"Submission retries: {state.pursuit_retry_attempts} "
+                    "(automatic backoff pending)"
+                )
         if status.get("type") == "retry":
             lines.append(
                 f"Retry: attempt {status.get('attempt', '?')} — {status.get('message', 'waiting')}"
@@ -338,7 +706,10 @@ class MatrixOpenCodeBot:
             return
         pending = min(state.pending_permissions, key=lambda value: value.created)
         await self.opencode.reply_permission(
-            state.session_id, pending.id, state.directory, response
+            pending.session_id or self._active_session_id(state),
+            pending.id,
+            state.directory,
+            response,
         )
         state.pending_permissions = [item for item in state.pending_permissions if item.id != pending.id]
         self._touch_activity(state)
@@ -362,13 +733,15 @@ class MatrixOpenCodeBot:
         if not state:
             await self.send_text(room_id, "No session is mapped to this room.")
             return
-        was_obsessing = state.obsess_goal is not None
-        state.obsess_goal = None
-        state.obsess_iteration = 0
+        was_pursuing = state.pursuit_goal is not None
+        verifier = state.verifier_session_id
+        active_session_id = self._active_session_id(state)
+        active_was_verifier = bool(verifier and active_session_id == verifier)
+        self._clear_pursuit(state)
         state.watchdog_recovery_pending = False
         state.watchdog_recovery_attempts = 0
         await self.store.save()
-        status = await self._status(state)
+        status = await self._status(state, active_session_id)
         if status.get("type") == "idle":
             if state.in_flight_event_id:
                 state.stop_requested = True
@@ -376,14 +749,22 @@ class MatrixOpenCodeBot:
             else:
                 await self.send_text(
                     room_id,
-                    "Obsession stopped." if was_obsessing else "The session is already idle.",
+                    "Pursuit stopped." if was_pursuing else "The session is already idle.",
                 )
+            if verifier:
+                with contextlib.suppress(OpenCodeError):
+                    await self.opencode.delete_session(verifier, state.directory)
             return
-        stopped = await self.opencode.abort(state.session_id, state.directory)
+        stopped = await self.opencode.abort(active_session_id, state.directory)
         if stopped:
             state.stop_requested = True
             state.activity = "stop requested"
+            if active_was_verifier and state.in_flight_event_id:
+                await self.finalize(room_id, state, "Stopped.")
         await self.send_text(room_id, "Stop requested." if stopped else "OpenCode did not stop the session.")
+        if verifier:
+            with contextlib.suppress(OpenCodeError):
+                await self.opencode.delete_session(verifier, state.directory)
 
     async def command_reset(self, room_id: str) -> None:
         state = self.store.rooms.get(room_id)
@@ -391,7 +772,7 @@ class MatrixOpenCodeBot:
             await self.send_text(room_id, "This room has no session mapping.")
             return
         status = await self._status(state)
-        if state.in_flight_event_id or status.get("type") != "idle":
+        if state.pursuit_goal or state.in_flight_event_id or status.get("type") != "idle":
             await self.send_text(room_id, "The session is busy. Use !stop before !reset.")
             return
         await self.store.remove(room_id)
@@ -439,12 +820,15 @@ class MatrixOpenCodeBot:
                 except OpenCodeError as exc:
                     LOG.warning(
                         "Watchdog could not inspect OpenCode session %s in %s: %s",
-                        state.session_id,
+                        self._active_session_id(state),
                         room_id,
                         exc,
                     )
                 except Exception:
-                    LOG.exception("Watchdog failed for OpenCode session %s", state.session_id)
+                    LOG.exception(
+                        "Watchdog failed for OpenCode session %s",
+                        self._active_session_id(state),
+                    )
 
     async def _watchdog_room(self, room_id: str, state: RoomSession) -> None:
         status = await self._status(state)
@@ -458,17 +842,18 @@ class MatrixOpenCodeBot:
         # A completed assistant record is stronger evidence than the occasionally stale
         # session status map. Incomplete assistant records are created while a turn runs,
         # so completion metadata is required before taking this path.
-        messages = await self.opencode.messages(state.session_id, state.directory, limit=20)
+        active_session_id = self._active_session_id(state)
+        messages = await self.opencode.messages(active_session_id, state.directory, limit=20)
         latest_assistant = _latest_assistant_for_prompt(messages, state.prompt_started_ms)
         if latest_assistant and _message_completed(latest_assistant):
-            cleared = await self.opencode.abort(state.session_id, state.directory)
+            cleared = await self.opencode.abort(active_session_id, state.directory)
             if not cleared:
                 LOG.warning(
                     "Watchdog found a completed response for %s but could not clear stale busy status",
-                    state.session_id,
+                    active_session_id,
                 )
                 return
-            LOG.warning("Watchdog cleared stale busy status for %s", state.session_id)
+            LOG.warning("Watchdog cleared stale busy status for %s", active_session_id)
             await self._complete_idle(room_id, state)
             return
 
@@ -492,11 +877,11 @@ class MatrixOpenCodeBot:
 
         LOG.warning(
             "Watchdog interrupting session %s after %ss without activity (attempt %s)",
-            state.session_id,
+            active_session_id,
             self.settings.stuck_timeout_seconds,
             state.watchdog_recovery_attempts,
         )
-        stopped = await self.opencode.abort(state.session_id, state.directory)
+        stopped = await self.opencode.abort(active_session_id, state.directory)
         if not stopped:
             state.activity = "Watchdog interrupt failed; retrying after the timeout"
             if state.in_flight_event_id:
@@ -521,16 +906,19 @@ class MatrixOpenCodeBot:
             final_text = f"{partial}\n\n{notice}" if partial else notice
             state.watchdog_recovery_pending = False
             await self.finalize(room_id, state, final_text)
-            if state.obsess_goal:
-                await self._continue_obsession(room_id, state)
+            if state.pursuit_goal:
+                await self._resume_pursuit_phase(room_id, state)
             else:
                 await self._submit_prompt(room_id, state, WATCHDOG_CONTINUATION)
             return
 
         state.watchdog_recovery_pending = False
         state.watchdog_recovery_attempts = 0
-        await self.finalize(room_id, state)
-        await self._continue_obsession(room_id, state)
+        raw = self._combined_text(state) or await self._recover_response(state)
+        if state.pursuit_goal:
+            await self._handle_pursuit_idle(room_id, state, raw)
+        else:
+            await self.finalize(room_id, state, raw or None)
 
     async def handle_opencode_event(self, event: dict[str, Any]) -> None:
         directory = event.get("directory")
@@ -548,11 +936,13 @@ class MatrixOpenCodeBot:
         matching = [
             (room_id, state)
             for room_id, state in self.store.rooms.items()
-            if state.session_id == session_id
+            if session_id in {state.session_id, state.verifier_session_id}
             and (not directory or Path(state.directory) == Path(str(directory)))
         ]
         for room_id, state in matching:
             async with self.room_locks[room_id]:
+                if session_id != self._active_session_id(state):
+                    continue
                 await self._handle_room_event(room_id, state, str(event_type), properties)
 
     async def _handle_room_event(
@@ -580,6 +970,7 @@ class MatrixOpenCodeBot:
                 type=str(properties.get("type") or "unknown"),
                 pattern=pattern[:500],
                 created=_integer((properties.get("time") or {}).get("created")),
+                session_id=self._active_session_id(state),
             )
             state.pending_permissions.append(pending)
             await self.store.save()
@@ -684,6 +1075,10 @@ class MatrixOpenCodeBot:
                 self.schedule_live_edit(room_id, state)
                 return
             await self.finalize(room_id, state, f"OpenCode error: {detail}")
+            if state.pursuit_goal:
+                state.pursuit_retry_attempts += 1
+                await self.store.save()
+                self._schedule_pursuit_retry(room_id, state)
             return
 
         if event_type == "session.idle":
@@ -691,7 +1086,10 @@ class MatrixOpenCodeBot:
                 # An idle event from an aborted turn can arrive after its continuation has
                 # started. Confirm current server state before finalizing the current turn.
                 if (await self._status(state)).get("type") != "idle":
-                    LOG.info("Ignoring stale idle event for busy session %s", state.session_id)
+                    LOG.info(
+                        "Ignoring stale idle event for busy session %s",
+                        self._active_session_id(state),
+                    )
                     return
                 await self._complete_idle(room_id, state)
             else:
@@ -741,9 +1139,14 @@ class MatrixOpenCodeBot:
 
     async def _recover_response(self, state: RoomSession) -> str:
         try:
-            messages = await self.opencode.messages(state.session_id, state.directory, limit=20)
+            session_id = self._active_session_id(state)
+            messages = await self.opencode.messages(session_id, state.directory, limit=20)
         except OpenCodeError as exc:
-            LOG.warning("Could not recover final response for %s: %s", state.session_id, exc)
+            LOG.warning(
+                "Could not recover final response for %s: %s",
+                self._active_session_id(state),
+                exc,
+            )
             return ""
         threshold = (state.prompt_started_ms or 0) - 1000
         for message in reversed(messages):
@@ -789,7 +1192,11 @@ class MatrixOpenCodeBot:
         if state.activity_history:
             details.append("Recent: " + " → ".join(state.activity_history[-3:]))
         progress = "\n".join([status_line, *details])
-        response = MatrixOpenCodeBot._combined_text(state)
+        response = (
+            ""
+            if state.pursuit_phase in {"specifying", "verifying"}
+            else MatrixOpenCodeBot._combined_text(state)
+        )
         reasoning = "".join(state.reasoning_parts.values()).strip()
         if len(reasoning) > MAX_REASONING_CHARS:
             reasoning = "…" + reasoning[-MAX_REASONING_CHARS:]
@@ -840,6 +1247,29 @@ class MatrixOpenCodeBot:
                     if title != state.title:
                         state.title = title
                         changed = True
+                    if state.pursuit_goal and state.verifier_session_id:
+                        try:
+                            await self.opencode.get_session(
+                                state.verifier_session_id, state.directory
+                            )
+                        except OpenCodeError as verifier_error:
+                            if verifier_error.status_code != 404:
+                                raise
+                            LOG.warning(
+                                "Recreating missing pursuit verifier %s",
+                                state.verifier_session_id,
+                            )
+                            state.verifier_session_id = None
+                            if state.pursuit_phase in {"specifying", "verifying"}:
+                                if state.in_flight_event_id:
+                                    await self.finalize(
+                                        room_id,
+                                        state,
+                                        "Verifier session was missing after restart; "
+                                        "recreated and continuing.",
+                                    )
+                                await self._replace_verifier(state)
+                            changed = True
                     if state.in_flight_event_id:
                         # Do not immediately interrupt a restored run based on an old prompt
                         # timestamp. Give it a complete silence window after this process starts.
@@ -864,18 +1294,38 @@ class MatrixOpenCodeBot:
         if changed:
             await self.store.save()
 
-    async def resume_obsessions(self) -> None:
-        """Restart persisted loops after the global event listener is running."""
+    async def resume_pursuits(self) -> None:
+        """Restart persisted pursuit phases after the global event listener is running."""
         for room_id, state in list(self.store.rooms.items()):
-            if not state.obsess_goal or state.in_flight_event_id:
+            if (
+                not state.pursuit_goal
+                or state.in_flight_event_id
+                or state.pursuit_phase == "waiting_input"
+            ):
                 continue
             async with self.room_locks[room_id]:
                 if (
-                    state.obsess_goal
+                    state.pursuit_goal
                     and not state.in_flight_event_id
                     and (await self._status(state)).get("type") == "idle"
                 ):
-                    await self._continue_obsession(room_id, state)
+                    await self._resume_pursuit_phase(room_id, state)
+
+    async def _resume_pursuit_phase(self, room_id: str, state: RoomSession) -> None:
+        if state.pursuit_phase == "specifying":
+            await self._submit_verifier(room_id, state, self._specification_prompt(state))
+        elif state.pursuit_phase == "verifying":
+            await self._submit_verifier(room_id, state, self._verification_prompt(state))
+        elif state.pursuit_phase == "working":
+            if not state.acceptance_criteria:
+                # Legacy !obsess migrations must establish a frozen contract first.
+                state.pursuit_phase = "specifying"
+                await self.store.save()
+                await self._submit_verifier(room_id, state, self._specification_prompt(state))
+            else:
+                state.pursuit_iteration = max(1, state.pursuit_iteration + 1)
+                await self.store.save()
+                await self._submit_prompt(room_id, state, self._worker_prompt(state))
 
     async def send_text(self, room_id: str, body: str) -> str | None:
         try:
@@ -926,8 +1376,12 @@ class MatrixOpenCodeBot:
             self.watchdog_task = None
         for task in self.edit_tasks.values():
             task.cancel()
+        for task in self.retry_tasks.values():
+            task.cancel()
         if self.edit_tasks:
             await asyncio.gather(*self.edit_tasks.values(), return_exceptions=True)
+        if self.retry_tasks:
+            await asyncio.gather(*self.retry_tasks.values(), return_exceptions=True)
 
 
 def split_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
@@ -964,6 +1418,80 @@ def render_diffs(diffs: list[dict[str, Any]]) -> str:
         output.extend(unified)
         output.append("")
     return "\n".join(output).rstrip()
+
+
+def _parse_pursuit_control(text: str, phase: str | None) -> dict[str, Any] | None:
+    matches = CONTROL_PATTERN.findall(text)
+    if len(matches) != 1:
+        return None
+    try:
+        value = json.loads(matches[0])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+
+    if phase == "specifying":
+        criteria = value.get("criteria")
+        assumptions = value.get("assumptions")
+        needs_input = value.get("needs_input")
+        question = value.get("question")
+        if (
+            value.get("type") != "contract"
+            or not isinstance(criteria, list)
+            or not criteria
+            or not all(isinstance(item, str) and item.strip() for item in criteria)
+            or not isinstance(assumptions, list)
+            or not all(isinstance(item, str) for item in assumptions)
+            or not isinstance(needs_input, bool)
+            or (needs_input and (not isinstance(question, str) or not question.strip()))
+        ):
+            return None
+        return {
+            "criteria": [item.strip() for item in criteria],
+            "assumptions": [item.strip() for item in assumptions if item.strip()],
+            "needs_input": needs_input,
+            "question": question.strip() if isinstance(question, str) else None,
+        }
+
+    criteria = value.get("criteria")
+    evidence = value.get("evidence")
+    verdict = value.get("verdict")
+    question = value.get("question")
+    if (
+        value.get("type") != "verdict"
+        or verdict not in {"complete", "continue", "needs_input"}
+        or not isinstance(criteria, list)
+        or not criteria
+        or not isinstance(evidence, list)
+        or not all(isinstance(item, str) for item in evidence)
+        or (verdict == "needs_input" and (not isinstance(question, str) or not question.strip()))
+    ):
+        return None
+    normalized: list[dict[str, str]] = []
+    for item in criteria:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("criterion"), str)
+            or item.get("status") not in {"pass", "fail", "unknown"}
+            or not isinstance(item.get("evidence"), str)
+        ):
+            return None
+        normalized.append(
+            {
+                "criterion": item["criterion"].strip(),
+                "status": item["status"],
+                "evidence": item["evidence"].strip(),
+            }
+        )
+    return {
+        "verdict": verdict,
+        "criteria": normalized,
+        "evidence": [item.strip() for item in evidence if item.strip()],
+        "feedback": str(value.get("feedback") or "").strip(),
+        "gap": str(value.get("gap") or "").strip(),
+        "question": question.strip() if isinstance(question, str) else None,
+    }
 
 
 def _event_session_id(event_type: Any, properties: dict[str, Any]) -> str | None:
@@ -1143,7 +1671,7 @@ async def run() -> None:
             await client.sync(timeout=30_000, full_state=True, set_presence="online")
             event_task = asyncio.create_task(bot.run_event_loop())
             await bot.validate_restored_state()
-            await bot.resume_obsessions()
+            await bot.resume_pursuits()
             bot.start_watchdog()
             LOG.info(
                 "Matrix OpenCode bot logged in as %s on device %s",

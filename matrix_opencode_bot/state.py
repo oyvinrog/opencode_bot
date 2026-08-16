@@ -18,6 +18,7 @@ class PendingPermission:
     type: str
     pattern: str = ""
     created: int = 0
+    session_id: str = ""
 
 
 @dataclass
@@ -28,8 +29,22 @@ class RoomSession:
     in_flight_event_id: str | None = None
     prompt_started_ms: int | None = None
     pending_permissions: list[PendingPermission] = field(default_factory=list)
-    obsess_goal: str | None = None
-    obsess_iteration: int = 0
+    pursuit_goal: str | None = None
+    pursuit_phase: str | None = None
+    pursuit_iteration: int = 0
+    verifier_session_id: str | None = None
+    acceptance_criteria: list[str] = field(default_factory=list)
+    pursuit_criteria_status: dict[str, str] = field(default_factory=dict)
+    pursuit_assumptions: list[str] = field(default_factory=list)
+    pursuit_reflections: list[str] = field(default_factory=list)
+    pursuit_evidence: list[str] = field(default_factory=list)
+    pursuit_gap: str | None = None
+    pursuit_stagnation_count: int = 0
+    pursuit_signature: str | None = None
+    pursuit_pending_question: str | None = None
+    pursuit_protocol_failures: int = 0
+    pursuit_retry_attempts: int = 0
+    pursuit_last_worker_report: str | None = None
     watchdog_recovery_pending: bool = False
     watchdog_recovery_attempts: int = 0
 
@@ -50,8 +65,22 @@ class RoomSession:
             "in_flight_event_id": self.in_flight_event_id,
             "prompt_started_ms": self.prompt_started_ms,
             "pending_permissions": [asdict(value) for value in self.pending_permissions],
-            "obsess_goal": self.obsess_goal,
-            "obsess_iteration": self.obsess_iteration,
+            "pursuit_goal": self.pursuit_goal,
+            "pursuit_phase": self.pursuit_phase,
+            "pursuit_iteration": self.pursuit_iteration,
+            "verifier_session_id": self.verifier_session_id,
+            "acceptance_criteria": self.acceptance_criteria,
+            "pursuit_criteria_status": self.pursuit_criteria_status,
+            "pursuit_assumptions": self.pursuit_assumptions,
+            "pursuit_reflections": self.pursuit_reflections,
+            "pursuit_evidence": self.pursuit_evidence,
+            "pursuit_gap": self.pursuit_gap,
+            "pursuit_stagnation_count": self.pursuit_stagnation_count,
+            "pursuit_signature": self.pursuit_signature,
+            "pursuit_pending_question": self.pursuit_pending_question,
+            "pursuit_protocol_failures": self.pursuit_protocol_failures,
+            "pursuit_retry_attempts": self.pursuit_retry_attempts,
+            "pursuit_last_worker_report": self.pursuit_last_worker_report,
             "watchdog_recovery_pending": self.watchdog_recovery_pending,
             "watchdog_recovery_attempts": self.watchdog_recovery_attempts,
         }
@@ -63,6 +92,12 @@ class RoomSession:
             for item in value.get("pending_permissions", [])
             if isinstance(item, dict) and item.get("id")
         ]
+        legacy_goal = value.get("obsess_goal")
+        pursuit_goal = value.get("pursuit_goal") or legacy_goal
+        pursuit_phase = value.get("pursuit_phase")
+        if pursuit_goal and not pursuit_phase:
+            # Resume old unconditional loops through the new verifier-backed workflow.
+            pursuit_phase = "working" if value.get("in_flight_event_id") else "specifying"
         return cls(
             session_id=str(value["session_id"]),
             directory=str(value["directory"]),
@@ -70,12 +105,46 @@ class RoomSession:
             in_flight_event_id=value.get("in_flight_event_id"),
             prompt_started_ms=value.get("prompt_started_ms"),
             pending_permissions=permissions,
-            obsess_goal=(
-                str(value["obsess_goal"])
-                if value.get("obsess_goal")
+            pursuit_goal=str(pursuit_goal) if pursuit_goal else None,
+            pursuit_phase=str(pursuit_phase) if pursuit_phase else None,
+            pursuit_iteration=int(
+                value.get("pursuit_iteration") or value.get("obsess_iteration") or 0
+            ),
+            verifier_session_id=(
+                str(value["verifier_session_id"])
+                if value.get("verifier_session_id")
                 else None
             ),
-            obsess_iteration=int(value.get("obsess_iteration") or 0),
+            acceptance_criteria=_string_list(value.get("acceptance_criteria")),
+            pursuit_criteria_status={
+                str(key): str(status)
+                for key, status in (value.get("pursuit_criteria_status") or {}).items()
+                if status in {"pass", "fail", "unknown"}
+            }
+            if isinstance(value.get("pursuit_criteria_status"), dict)
+            else {},
+            pursuit_assumptions=_string_list(value.get("pursuit_assumptions")),
+            pursuit_reflections=_string_list(value.get("pursuit_reflections")),
+            pursuit_evidence=_string_list(value.get("pursuit_evidence")),
+            pursuit_gap=str(value["pursuit_gap"]) if value.get("pursuit_gap") else None,
+            pursuit_stagnation_count=int(value.get("pursuit_stagnation_count") or 0),
+            pursuit_signature=(
+                str(value["pursuit_signature"])
+                if value.get("pursuit_signature")
+                else None
+            ),
+            pursuit_pending_question=(
+                str(value["pursuit_pending_question"])
+                if value.get("pursuit_pending_question")
+                else None
+            ),
+            pursuit_protocol_failures=int(value.get("pursuit_protocol_failures") or 0),
+            pursuit_retry_attempts=int(value.get("pursuit_retry_attempts") or 0),
+            pursuit_last_worker_report=(
+                str(value["pursuit_last_worker_report"])
+                if value.get("pursuit_last_worker_report")
+                else None
+            ),
             watchdog_recovery_pending=bool(
                 value.get("watchdog_recovery_pending", False)
             ),
@@ -109,7 +178,7 @@ class StateStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.parent.chmod(stat.S_IRWXU)
             temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            payload = {"version": 1, "rooms": {k: v.to_dict() for k, v in self.rooms.items()}}
+            payload = {"version": 2, "rooms": {k: v.to_dict() for k, v in self.rooms.items()}}
             temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
             os.replace(temporary, self.path)
@@ -122,3 +191,9 @@ class StateStore:
         value = self.rooms.pop(room_id, None)
         await self.save()
         return value
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]

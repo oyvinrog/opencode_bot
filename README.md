@@ -88,7 +88,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!help` — show the command list
 - `!new [directory]` — create a new session, using the default directory when omitted
 - Ordinary messages — prompt the current session, creating one in the default directory if needed
-- `!obsess <goal>` — repeatedly pursue the same goal until `!stop`
+- `!pursue <goal>` — pursue a goal until independently verified or `!stop`
 - `!status` — show the session, directory, activity, permissions, and change totals
 - `!allow` — allow the oldest pending permission once
 - `!deny` — reject the oldest pending permission
@@ -103,11 +103,24 @@ deletes the OpenCode session nor reverts files, and it is refused while the
 session is busy. New sessions also leave earlier OpenCode sessions and their
 changes intact.
 
-Starting a session posts a compact reminder of the available commands. `!obsess`
-runs the goal as a series of passes in the same OpenCode session, so each pass can
-build on the previous ones. After a pass finishes, the bot immediately starts the
-next one and continues indefinitely, including across bot restarts. `!stop` clears
-the ongoing goal and aborts the active pass.
+Starting a session posts a compact reminder of the available commands. `!pursue`
+first creates a separate verifier session that freezes task-aware acceptance
+criteria. A worker then acts in repeated passes while the verifier independently
+checks evidence after every pass. The pursuit completes automatically only when
+all mandatory criteria pass. Material ambiguities pause for an ordinary Matrix
+reply; difficulty or lack of immediate progress does not stop the loop.
+
+Pursuits survive bot restarts and have no pass or token limit. Verifier feedback,
+accepted evidence, failed approaches, and unresolved gaps are persisted. Three
+passes with the same gap and no new evidence trigger a fresh worker context with
+that durable memory. `!stop` clears the pursuit, aborts its active worker or
+verifier turn, and removes the temporary verifier session.
+
+Verification adapts to the task: code work favors executable checks, web research
+checks source authority, identity, recency, claim coverage, and contradictions,
+and qualitative work uses a frozen rubric while separating sourced facts from
+inference. The verifier is instructed not to edit or take consequential actions;
+OpenCode's normal permissions still govern every tool call.
 
 Assistant text and safe progress are relayed through Matrix `m.replace` edits at
 most once per second. While busy, the progress message shows elapsed time, the

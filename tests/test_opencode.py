@@ -77,6 +77,22 @@ async def test_prompt_uses_async_endpoint() -> None:
     assert kwargs["json"] == {"parts": [{"type": "text", "text": "hello"}]}
 
 
+async def test_verifier_prompt_options_and_session_deletion() -> None:
+    fake = FakeSession([FakeResponse(204, ""), FakeResponse(200, True)])
+    client = OpenCodeClient("http://localhost", session=fake)  # type: ignore[arg-type]
+    await client.prompt_async(
+        "verify", "/work", "check", system="read only", tools={"write": False}
+    )
+    assert fake.calls[0][2]["json"] == {
+        "parts": [{"type": "text", "text": "check"}],
+        "system": "read only",
+        "tools": {"write": False},
+    }
+    assert await client.delete_session("verify", "/work") is True
+    assert fake.calls[1][0] == "DELETE"
+    assert fake.calls[1][1].endswith("/session/verify")
+
+
 async def test_sse_parser_yields_global_event() -> None:
     event = {"directory": "/work", "payload": {"type": "session.idle", "properties": {"sessionID": "ses"}}}
     fake = FakeSession([FakeResponse(200, "", [f"data: {json.dumps(event)}\n".encode(), b"\n"])])
