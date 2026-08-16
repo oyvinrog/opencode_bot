@@ -28,6 +28,8 @@ class RoomSession:
     in_flight_event_id: str | None = None
     prompt_started_ms: int | None = None
     pending_permissions: list[PendingPermission] = field(default_factory=list)
+    obsess_goal: str | None = None
+    obsess_iteration: int = 0
 
     # Transient event aggregation fields are deliberately not persisted.
     text_parts: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
@@ -45,6 +47,8 @@ class RoomSession:
             "in_flight_event_id": self.in_flight_event_id,
             "prompt_started_ms": self.prompt_started_ms,
             "pending_permissions": [asdict(value) for value in self.pending_permissions],
+            "obsess_goal": self.obsess_goal,
+            "obsess_iteration": self.obsess_iteration,
         }
 
     @classmethod
@@ -61,6 +65,12 @@ class RoomSession:
             in_flight_event_id=value.get("in_flight_event_id"),
             prompt_started_ms=value.get("prompt_started_ms"),
             pending_permissions=permissions,
+            obsess_goal=(
+                str(value["obsess_goal"])
+                if value.get("obsess_goal")
+                else None
+            ),
+            obsess_iteration=int(value.get("obsess_iteration") or 0),
         )
 
 

@@ -88,6 +88,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!help` — show the command list
 - `!new [directory]` — create a new session, using the default directory when omitted
 - Ordinary messages — prompt the current session, creating one in the default directory if needed
+- `!obsess <goal>` — repeatedly pursue the same goal until `!stop`
 - `!status` — show the session, directory, activity, permissions, and change totals
 - `!allow` — allow the oldest pending permission once
 - `!deny` — reject the oldest pending permission
@@ -101,6 +102,12 @@ different workspace. One prompt at a time is accepted per room. `!reset` neither
 deletes the OpenCode session nor reverts files, and it is refused while the
 session is busy. New sessions also leave earlier OpenCode sessions and their
 changes intact.
+
+Starting a session posts a compact reminder of the available commands. `!obsess`
+runs the goal as a series of passes in the same OpenCode session, so each pass can
+build on the previous ones. After a pass finishes, the bot immediately starts the
+next one and continues indefinitely, including across bot restarts. `!stop` clears
+the ongoing goal and aborts the active pass.
 
 Assistant text and safe progress are relayed through Matrix `m.replace` edits at
 most once per second. While busy, the progress message shows elapsed time, the

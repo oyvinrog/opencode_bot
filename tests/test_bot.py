@@ -110,7 +110,79 @@ async def test_prompt_automatically_creates_missing_session(tmp_path: Path) -> N
         "ses_1", str(tmp_path.resolve()), "Hello OpenCode"
     )
     assert store.rooms["!one:example"].session_id == "ses_1"
-    assert matrix.room_send.await_args_list[0].kwargs["content"]["body"] == "Working…"
+    assert "Commands:" in matrix.room_send.await_args_list[0].kwargs["content"]["body"]
+    assert matrix.room_send.await_args_list[1].kwargs["content"]["body"] == "Working…"
+
+
+async def test_new_session_includes_command_reminder(tmp_path: Path) -> None:
+    bot, matrix, _, _ = make_bot(tmp_path)
+
+    await bot.command_new("!one:example", None)
+
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "Commands:" in body
+    assert "!new [directory]" in body
+    assert "!obsess <goal>" in body
+
+
+async def test_obsess_repeats_goal_after_each_idle_event(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+
+    await bot.command_obsess("!one:example", "Find the root cause")
+
+    state = store.rooms["!one:example"]
+    assert state.obsess_goal == "Find the root cause"
+    assert state.obsess_iteration == 1
+    assert "Find the root cause" in opencode.prompt_async.await_args.args[2]
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {"type": "session.idle", "properties": {"sessionID": "ses_1"}},
+    })
+
+    assert opencode.prompt_async.await_count == 2
+    assert "Continue pursuing" in opencode.prompt_async.await_args.args[2]
+    assert "Find the root cause" in opencode.prompt_async.await_args.args[2]
+    assert state.obsess_iteration == 2
+    assert state.in_flight_event_id is not None
+    assert "pass 2" in matrix.room_send.await_args.kwargs["content"]["body"]
+
+
+async def test_stop_clears_obsession_before_aborting(tmp_path: Path) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        in_flight_event_id="$event",
+        obsess_goal="Keep looking",
+        obsess_iteration=4,
+    )
+    store.rooms["!one:example"] = state
+    opencode.session_status.return_value = {"ses_1": {"type": "busy"}}
+
+    await bot.command_stop("!one:example")
+
+    assert state.obsess_goal is None
+    assert state.obsess_iteration == 0
+    opencode.abort.assert_awaited_once_with("ses_1", str(tmp_path))
+
+
+async def test_persisted_idle_obsession_resumes(tmp_path: Path) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        obsess_goal="Keep investigating",
+        obsess_iteration=2,
+    )
+    store.rooms["!one:example"] = state
+
+    await bot.resume_obsessions()
+
+    assert state.obsess_iteration == 3
+    assert state.in_flight_event_id is not None
+    assert "Keep investigating" in opencode.prompt_async.await_args.args[2]
 
 
 async def test_busy_prompt_is_rejected(tmp_path: Path) -> None:

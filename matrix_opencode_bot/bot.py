@@ -38,12 +38,18 @@ EDIT_INTERVAL_SECONDS = 1.0
 HELP = """Matrix–OpenCode commands:
 !new [directory] — start a session
 Ordinary messages — prompt the current session, creating one if needed
+!obsess <goal> — keep pursuing a goal until !stop
 !status — show current activity
 !allow / !deny — answer the oldest permission request
 !diff — show changed files
-!stop — abort the current operation
+!stop — stop an obsession and abort the current operation
 !reset — discard the room-to-session mapping
 !help — show this message"""
+
+SESSION_REMINDER = (
+    "Commands: !new [directory], !obsess <goal>, !status, !diff, !allow, !deny, "
+    "!stop, !reset, !help"
+)
 
 
 class MatrixOpenCodeBot:
@@ -107,6 +113,8 @@ class MatrixOpenCodeBot:
                 await self.command_new(room_id, argument.strip() or None)
             elif command == "!status":
                 await self.command_status(room_id)
+            elif command == "!obsess":
+                await self.command_obsess(room_id, argument.strip())
             elif command == "!allow":
                 await self.command_permission(room_id, "once")
             elif command == "!deny":
@@ -132,7 +140,11 @@ class MatrixOpenCodeBot:
 
     async def command_new(self, room_id: str, requested: str | None) -> None:
         current = self.store.rooms.get(room_id)
-        if current and (current.in_flight_event_id or (await self._status(current)).get("type") != "idle"):
+        if current and (
+            current.obsess_goal
+            or current.in_flight_event_id
+            or (await self._status(current)).get("type") != "idle"
+        ):
             await self.send_text(room_id, "The current session is busy. Use !stop before !new.")
             return
         try:
@@ -142,7 +154,8 @@ class MatrixOpenCodeBot:
             return
         await self.send_text(
             room_id,
-            f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}",
+            f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}"
+            f"\n\n{SESSION_REMINDER}",
         )
 
     async def _create_room_session(
@@ -162,6 +175,7 @@ class MatrixOpenCodeBot:
 
     async def prompt(self, room_id: str, text: str) -> None:
         state = self.store.rooms.get(room_id)
+        created = state is None
         if not state:
             try:
                 state = await self._create_room_session(room_id)
@@ -169,14 +183,31 @@ class MatrixOpenCodeBot:
                 await self.send_text(room_id, f"Cannot automatically start session: {exc}")
                 return
         status = await self._status(state)
-        if state.in_flight_event_id or status.get("type") != "idle":
+        if state.obsess_goal or state.in_flight_event_id or status.get("type") != "idle":
             await self.send_text(room_id, "This session is busy. Wait for it to finish or use !stop.")
             return
 
-        event_id = await self.send_text(room_id, "Working…")
+        if created:
+            await self.send_text(
+                room_id,
+                f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}"
+                f"\n\n{SESSION_REMINDER}",
+            )
+
+        await self._submit_prompt(room_id, state, text)
+
+    async def _submit_prompt(self, room_id: str, state: RoomSession, text: str) -> bool:
+        """Submit one pass after the caller has established that the session is idle."""
+
+        label = (
+            f"Obsessing… pass {state.obsess_iteration}"
+            if state.obsess_goal
+            else "Working…"
+        )
+        event_id = await self.send_text(room_id, label)
         if not event_id:
             LOG.error("Not submitting prompt because the Matrix progress message could not be sent")
-            return
+            return False
         state.in_flight_event_id = event_id
         state.prompt_started_ms = int(time.time() * 1000)
         state.text_parts.clear()
@@ -192,6 +223,59 @@ class MatrixOpenCodeBot:
             await self.send_edit(room_id, event_id, f"OpenCode error: {exc}")
             self._clear_in_flight(state)
             await self.store.save()
+            return False
+        return True
+
+    async def command_obsess(self, room_id: str, goal: str) -> None:
+        if not goal:
+            await self.send_text(room_id, "Usage: !obsess <goal>")
+            return
+        state = self.store.rooms.get(room_id)
+        created = state is None
+        if not state:
+            try:
+                state = await self._create_room_session(room_id)
+            except ValueError as exc:
+                await self.send_text(room_id, f"Cannot automatically start session: {exc}")
+                return
+        status = await self._status(state)
+        if state.in_flight_event_id or status.get("type") != "idle":
+            await self.send_text(room_id, "This session is busy. Wait for it to finish or use !stop.")
+            return
+        state.obsess_goal = goal
+        state.obsess_iteration = 1
+        await self.store.save()
+        if created:
+            await self.send_text(
+                room_id,
+                f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}"
+                f"\n\n{SESSION_REMINDER}",
+            )
+        await self._submit_prompt(room_id, state, self._obsess_prompt(state))
+
+    @staticmethod
+    def _obsess_prompt(state: RoomSession) -> str:
+        goal = state.obsess_goal or ""
+        if state.obsess_iteration <= 1:
+            return (
+                f"Pursue this ongoing goal in this pass: {goal}\n\n"
+                "This is an ongoing loop. Make concrete progress in this pass and report what "
+                "you found or accomplished. The loop will ask you to continue until the user "
+                "sends !stop."
+            )
+        return (
+            f"Continue pursuing this ongoing goal: {goal}\n\n"
+            "Review the prior passes in this session, then make further concrete progress. "
+            "Investigate a useful new angle, verify unresolved assumptions, and do not merely "
+            "repeat the previous response. The user will send !stop when the loop should end."
+        )
+
+    async def _continue_obsession(self, room_id: str, state: RoomSession) -> None:
+        if not state.obsess_goal:
+            return
+        state.obsess_iteration += 1
+        await self.store.save()
+        await self._submit_prompt(room_id, state, self._obsess_prompt(state))
 
     async def command_status(self, room_id: str) -> None:
         state = self.store.rooms.get(room_id)
@@ -209,6 +293,8 @@ class MatrixOpenCodeBot:
         ]
         if state.activity:
             lines.append(f"Activity: {state.activity}")
+        if state.obsess_goal:
+            lines.append(f"Obsessing: pass {state.obsess_iteration} — {state.obsess_goal}")
         if status.get("type") == "retry":
             lines.append(
                 f"Retry: attempt {status.get('attempt', '?')} — {status.get('message', 'waiting')}"
@@ -254,12 +340,20 @@ class MatrixOpenCodeBot:
         if not state:
             await self.send_text(room_id, "No session is mapped to this room.")
             return
+        was_obsessing = state.obsess_goal is not None
+        state.obsess_goal = None
+        state.obsess_iteration = 0
+        await self.store.save()
         status = await self._status(state)
         if status.get("type") == "idle":
             if state.in_flight_event_id:
+                state.stop_requested = True
                 await self.finalize(room_id, state)
             else:
-                await self.send_text(room_id, "The session is already idle.")
+                await self.send_text(
+                    room_id,
+                    "Obsession stopped." if was_obsessing else "The session is already idle.",
+                )
             return
         stopped = await self.opencode.abort(state.session_id, state.directory)
         if stopped:
@@ -441,6 +535,7 @@ class MatrixOpenCodeBot:
         if event_type == "session.idle":
             if state.in_flight_event_id:
                 await self.finalize(room_id, state)
+                await self._continue_obsession(room_id, state)
             else:
                 state.activity = None
                 state.stop_requested = False
@@ -588,6 +683,19 @@ class MatrixOpenCodeBot:
                     LOG.warning("Could not validate restored mapping for %s; retaining it: %s", room_id, exc)
         if changed:
             await self.store.save()
+
+    async def resume_obsessions(self) -> None:
+        """Restart persisted loops after the global event listener is running."""
+        for room_id, state in list(self.store.rooms.items()):
+            if not state.obsess_goal or state.in_flight_event_id:
+                continue
+            async with self.room_locks[room_id]:
+                if (
+                    state.obsess_goal
+                    and not state.in_flight_event_id
+                    and (await self._status(state)).get("type") == "idle"
+                ):
+                    await self._continue_obsession(room_id, state)
 
     async def send_text(self, room_id: str, body: str) -> str | None:
         try:
@@ -812,6 +920,7 @@ async def run() -> None:
             await client.sync(timeout=30_000, full_state=True, set_presence="online")
             await bot.validate_restored_state()
             event_task = asyncio.create_task(bot.run_event_loop())
+            await bot.resume_obsessions()
             LOG.info(
                 "Matrix OpenCode bot logged in as %s on device %s",
                 client.user_id,
