@@ -32,6 +32,7 @@ class RoomSession:
     in_flight_event_id: str | None = None
     prompt_started_ms: int | None = None
     pending_permissions: list[PendingPermission] = field(default_factory=list)
+    yolo_permissions: bool = False
     pending_pursuit_goal: str | None = None
     pending_pursuit_reuse_session: bool = False
     pursuit_goal: str | None = None
@@ -83,6 +84,7 @@ class RoomSession:
             "in_flight_event_id": self.in_flight_event_id,
             "prompt_started_ms": self.prompt_started_ms,
             "pending_permissions": [asdict(value) for value in self.pending_permissions],
+            "yolo_permissions": self.yolo_permissions,
             "pending_pursuit_goal": self.pending_pursuit_goal,
             "pending_pursuit_reuse_session": self.pending_pursuit_reuse_session,
             "pursuit_goal": self.pursuit_goal,
@@ -136,6 +138,7 @@ class RoomSession:
             in_flight_event_id=value.get("in_flight_event_id"),
             prompt_started_ms=value.get("prompt_started_ms"),
             pending_permissions=permissions,
+            yolo_permissions=bool(value.get("yolo_permissions", False)),
             pending_pursuit_goal=(
                 str(value["pending_pursuit_goal"])
                 if value.get("pending_pursuit_goal")

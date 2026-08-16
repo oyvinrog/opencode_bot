@@ -109,6 +109,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!diagnose` — write `DIAGNOSIS.txt` in the mapped session directory
 - `!bump` — report inactivity and ask before restarting the same stalled turn
 - `!bump confirm` / `!bump cancel` — approve or cancel the proposed restart
+- `!yolo off` — disable session-scoped automatic permission approval
 - `!diff` — show unified diffs for the session
 - `!stop` — abort the current operation
 - `!reset` — discard only the room mapping
@@ -181,9 +182,13 @@ characters are split at completion.
 Both the current OpenCode `permission.asked` event schema and the legacy
 `permission.updated` schema are normalized. This is especially important for
 `external_directory`: an operation targeting a path outside the session worktree
-is paused and surfaced in Matrix for `y` or `n`, rather than appearing as
+is paused and surfaced in Matrix for `y`, `n`, or `YOLO`, rather than appearing as
 an indefinitely running tool. These replies are interpreted as permission answers
 only while the room has a pending request; otherwise they remain ordinary messages.
+`YOLO` approves all currently pending requests and automatically answers future
+requests for the mapped session, including pursuit worker and verifier sessions.
+It survives bot restarts, but `!new` and `!reset` clear it; `!yolo off` disables it.
+Automatic approvals do not override permissions OpenCode explicitly denies.
 
 An in-process watchdog checks active bot-submitted prompts every 30 seconds.
 Ordinary turns use `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default).
@@ -204,7 +209,7 @@ busy response as finished.
 When a watchdog deadline is reached, the bot sends a new Matrix room message—not
 only a replacement edit—so clients can generate a notification for the recovery.
 External-directory and other permission requests likewise arrive as new messages
-with explicit `y` / `n` instructions.
+with explicit `y` / `n` / `YOLO` instructions.
 
 `!bump` exposes the same recovery mechanism under explicit user control. It
 reports time since the last observable activity and compares it with the watchdog

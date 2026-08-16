@@ -92,6 +92,7 @@ Ordinary messages — prompt the current session, creating one if needed
 !status — show current activity
 !diagnose — write a detailed DIAGNOSIS.txt in the session directory
 !bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
+!yolo off — disable session-scoped automatic permission approval
 !diff — show changed files
 !stop — stop a pursuit and abort the current operation
 !reset — discard the room-to-session mapping
@@ -99,7 +100,7 @@ Ordinary messages — prompt the current session, creating one if needed
 
 SESSION_REMINDER = (
     "Commands: !new [directory], !pursue <goal>, !status, !diagnose, !bump, !diff, "
-    "!stop, !reset, !help"
+    "!yolo off, !stop, !reset, !help"
 )
 STARTUP_LOGO_PATH = Path(__file__).with_name("assets") / "openbot-logo.png"
 STARTUP_LOGO_WIDTH = 1280
@@ -178,6 +179,8 @@ class MatrixOpenCodeBot:
             has_pending_permission = bool(state and state.pending_permissions)
             if command in {"y", "n"} and not argument and has_pending_permission:
                 await self.command_permission(room_id, "once" if command == "y" else "reject")
+            elif command == "yolo" and not argument and has_pending_permission:
+                await self.command_yolo(room_id)
             elif command == "!help":
                 await self.send_text(room_id, HELP)
             elif command == "!new":
@@ -194,6 +197,8 @@ class MatrixOpenCodeBot:
                 await self.command_permission(room_id, "once")
             elif command == "!deny":
                 await self.command_permission(room_id, "reject")
+            elif command == "!yolo":
+                await self.command_yolo_setting(room_id, argument.strip().lower())
             elif command == "!diff":
                 await self.command_diff(room_id)
             elif command == "!stop":
@@ -971,6 +976,8 @@ Return exactly:
             )
         lines.extend(
             [
+                "Permission mode: "
+                + ("YOLO (auto-approve)" if state.yolo_permissions else "prompt"),
                 f"Pending permissions: {len(state.pending_permissions)}",
                 f"Changes: {len(diffs)} files, +{additions}/-{deletions}",
             ]
@@ -1257,17 +1264,97 @@ Return exactly:
             await self.send_text(room_id, "There is no pending permission request.")
             return
         pending = min(state.pending_permissions, key=lambda value: value.created)
-        await self.opencode.reply_permission(
-            pending.session_id or self._active_session_id(state),
-            pending.id,
-            state.directory,
-            response,
-        )
-        state.pending_permissions = [item for item in state.pending_permissions if item.id != pending.id]
-        self._touch_activity(state)
-        await self.store.save()
+        await self._reply_pending_permission(state, pending, response)
         verb = "Allowed once" if response == "once" else "Denied"
         await self.send_text(room_id, f"{verb}: {pending.title}")
+
+    async def command_yolo(self, room_id: str) -> None:
+        state = self.store.rooms.get(room_id)
+        if not state:
+            await self.send_text(room_id, "No session is mapped to this room.")
+            return
+        if not state.pending_permissions:
+            await self.send_text(room_id, "There is no pending permission request.")
+            return
+
+        state.yolo_permissions = True
+        await self.store.save()
+        approved = 0
+        stale = 0
+        failures: list[PendingPermission] = []
+        for pending in sorted(list(state.pending_permissions), key=lambda value: value.created):
+            try:
+                if await self._reply_pending_permission(
+                    state, pending, "once", discard_stale=True
+                ):
+                    approved += 1
+                else:
+                    stale += 1
+            except OpenCodeError as exc:
+                LOG.warning(
+                    "YOLO could not approve permission %s in %s: %s",
+                    pending.id,
+                    room_id,
+                    exc,
+                )
+                failures.append(pending)
+
+        message = (
+            "YOLO enabled for this session. Future permission requests will be "
+            f"automatically approved. Approved {approved} pending request(s)."
+        )
+        if stale:
+            message += f" Cleared {stale} stale request(s)."
+        if failures:
+            message += (
+                f" Could not approve {len(failures)} request(s); they remain pending. "
+                "Reply with y, n, or YOLO to retry."
+            )
+        await self.send_text(room_id, message)
+
+    async def command_yolo_setting(self, room_id: str, argument: str) -> None:
+        state = self.store.rooms.get(room_id)
+        if not state:
+            await self.send_text(room_id, "No session is mapped to this room.")
+            return
+        if argument != "off":
+            await self.send_text(
+                room_id,
+                "Usage: !yolo off (YOLO can only be enabled from a permission prompt).",
+            )
+            return
+        state.yolo_permissions = False
+        await self.store.save()
+        await self.send_text(room_id, "YOLO disabled. Future permissions will prompt again.")
+
+    async def _reply_pending_permission(
+        self,
+        state: RoomSession,
+        pending: PendingPermission,
+        response: str,
+        *,
+        discard_stale: bool = False,
+    ) -> bool:
+        try:
+            await self.opencode.reply_permission(
+                pending.session_id or self._active_session_id(state),
+                pending.id,
+                state.directory,
+                response,
+            )
+        except OpenCodeError as exc:
+            if not discard_stale or exc.status_code != 404:
+                raise
+            LOG.info("Discarding stale OpenCode permission request %s", pending.id)
+            replied = False
+        else:
+            replied = True
+        state.pending_permissions = [
+            item for item in state.pending_permissions if item.id != pending.id
+        ]
+        self._touch_activity(state)
+        await self.store.save()
+        return replied
 
     async def command_diff(self, room_id: str) -> None:
         state = self.store.rooms.get(room_id)
@@ -1670,10 +1757,34 @@ Return exactly:
             )
             state.pending_permissions.append(pending)
             await self.store.save()
+            if state.yolo_permissions:
+                try:
+                    approved = await self._reply_pending_permission(
+                        state, pending, "once", discard_stale=True
+                    )
+                except OpenCodeError as exc:
+                    LOG.warning(
+                        "YOLO could not auto-approve permission %s in %s: %s",
+                        pending.id,
+                        room_id,
+                        exc,
+                    )
+                    await self.send_text(
+                        room_id,
+                        f"YOLO could not auto-approve: {pending.title}\n"
+                        "The request remains pending. Reply with y, n, or YOLO to retry.",
+                    )
+                else:
+                    if approved:
+                        await self.send_text(room_id, f"YOLO auto-approved: {pending.title}")
+                return
             message = f"OpenCode requests permission: {pending.title}\nType: {pending.type}"
             if pending.pattern:
                 message += f"\nPattern: {pending.pattern}"
-            message += "\nReply with y or n."
+            message += (
+                "\nReply with y (allow once), n (deny), or YOLO "
+                "(allow everything for this session)."
+            )
             await self.send_text(room_id, message)
             return
 

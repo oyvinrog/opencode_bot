@@ -146,6 +146,7 @@ async def test_new_creates_and_persists_session(tmp_path: Path) -> None:
         str(tmp_path.resolve()), title="Matrix OpenCode session"
     )
     assert store.rooms["!one:example"].session_id == "ses_1"
+    assert store.rooms["!one:example"].yolo_permissions is False
     assert store.path.exists()
     assert "Started OpenCode session" in matrix.room_send.await_args.kwargs["content"]["body"]
 
@@ -1328,7 +1329,8 @@ async def test_current_permission_asked_schema_is_forwarded_to_matrix(
     assert pending[0].pattern == "/home/user/Documents/jobbsoek/*"
     body = matrix.room_send.await_args.kwargs["content"]["body"]
     assert "external_directory" in body
-    assert "Reply with y or n" in body
+    assert "y (allow once)" in body
+    assert "YOLO (allow everything for this session)" in body
 
 
 async def test_y_and_n_answer_pending_permissions(tmp_path: Path) -> None:
@@ -1377,6 +1379,149 @@ async def test_permission_answers_oldest_request(tmp_path: Path) -> None:
     )
     await bot.command_permission("!one:example", "reject")
     assert opencode.reply_permission.await_args.args[1] == "old"
+
+
+async def test_yolo_approves_all_pending_permissions_and_persists(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        pending_permissions=[
+            PendingPermission("new", "New", "bash", created=20),
+            PendingPermission("old", "Old", "edit", created=10),
+        ],
+    )
+    store.rooms["!one:example"] = state
+
+    await bot.on_message(room(), message(bot, "YOLO"))
+
+    assert state.yolo_permissions is True
+    assert state.pending_permissions == []
+    assert [call.args[1] for call in opencode.reply_permission.await_args_list] == [
+        "old",
+        "new",
+    ]
+    assert all(call.args[3] == "once" for call in opencode.reply_permission.await_args_list)
+    assert json.loads(store.path.read_text())["rooms"]["!one:example"][
+        "yolo_permissions"
+    ] is True
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "YOLO enabled for this session" in body
+    assert "Approved 2 pending request(s)" in body
+
+
+async def test_yolo_auto_approves_future_permission_without_prompt(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_worker",
+        str(tmp_path),
+        yolo_permissions=True,
+        pursuit_goal="Verify it",
+        pursuit_phase="verifying",
+        verifier_session_id="ses_verify",
+    )
+    store.rooms["!one:example"] = state
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "permission.asked",
+            "properties": {
+                "id": "perm_auto",
+                "sessionID": "ses_verify",
+                "permission": "bash",
+                "patterns": ["git status"],
+            },
+        },
+    })
+
+    opencode.reply_permission.assert_awaited_once_with(
+        "ses_verify", "perm_auto", str(tmp_path), "once"
+    )
+    assert state.pending_permissions == []
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert body == "YOLO auto-approved: bash"
+    assert "Reply with" not in body
+
+
+async def test_yolo_auto_approval_failure_keeps_request_pending(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession("ses_1", str(tmp_path), yolo_permissions=True)
+    store.rooms["!one:example"] = state
+    opencode.reply_permission.side_effect = OpenCodeError("offline")
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "permission.asked",
+            "properties": {
+                "id": "perm_failed",
+                "sessionID": "ses_1",
+                "permission": "bash",
+            },
+        },
+    })
+
+    assert [pending.id for pending in state.pending_permissions] == ["perm_failed"]
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "remains pending" in body
+    assert "y, n, or YOLO" in body
+
+
+async def test_yolo_discards_stale_permission(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession("ses_1", str(tmp_path), yolo_permissions=True)
+    store.rooms["!one:example"] = state
+    opencode.reply_permission.side_effect = OpenCodeError("not found", status_code=404)
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "permission.asked",
+            "properties": {
+                "id": "perm_stale",
+                "sessionID": "ses_1",
+                "permission": "bash",
+            },
+        },
+    })
+
+    assert state.pending_permissions == []
+    matrix.room_send.assert_not_awaited()
+
+
+async def test_yolo_off_disables_auto_approval_and_status_reports_mode(
+    tmp_path: Path,
+) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    state = RoomSession("ses_1", str(tmp_path), yolo_permissions=True)
+    store.rooms["!one:example"] = state
+
+    await bot.on_message(room(), message(bot, "!yolo off"))
+
+    assert state.yolo_permissions is False
+    assert "YOLO disabled" in matrix.room_send.await_args.kwargs["content"]["body"]
+
+    await bot.command_status("!one:example")
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "Permission mode: prompt" in body
+
+
+async def test_new_and_reset_do_not_carry_yolo_to_another_mapping(tmp_path: Path) -> None:
+    bot, _, _, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession(
+        "ses_old", str(tmp_path), yolo_permissions=True
+    )
+
+    await bot.command_new("!one:example", None)
+
+    assert store.rooms["!one:example"].session_id == "ses_1"
+    assert store.rooms["!one:example"].yolo_permissions is False
+
+    store.rooms["!one:example"].yolo_permissions = True
+    await bot.command_reset("!one:example")
+
+    assert "!one:example" not in store.rooms
 
 
 async def test_reset_refuses_busy_session(tmp_path: Path) -> None:
