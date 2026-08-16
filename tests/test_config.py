@@ -26,6 +26,7 @@ def test_settings_parse_required_values(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert settings.stuck_timeout_seconds == 900
     assert settings.pursuit_stuck_timeout_seconds == 180
     assert settings.pursuit_tool_timeout_seconds == 120
+    assert settings.matrix_edit_interval_seconds == 5
 
 
 def test_settings_can_enable_reasoning(
@@ -129,6 +130,17 @@ def test_pursuit_timeouts_must_be_positive(
     monkeypatch.setenv(name, "42")
     assert getattr(Settings.from_env(), attribute) == 42
     monkeypatch.setenv(name, "0")
+    with pytest.raises(ValueError, match="positive integer"):
+        Settings.from_env()
+
+
+def test_matrix_edit_interval_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("MATRIX_EDIT_INTERVAL_SECONDS", "8")
+    assert Settings.from_env().matrix_edit_interval_seconds == 8
+    monkeypatch.setenv("MATRIX_EDIT_INTERVAL_SECONDS", "0")
     with pytest.raises(ValueError, match="positive integer"):
         Settings.from_env()
 

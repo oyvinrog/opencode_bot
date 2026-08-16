@@ -34,7 +34,6 @@ from .state import PendingPermission, RoomSession, StateStore
 LOG = logging.getLogger("matrix_opencode")
 MAX_MESSAGE_CHARS = 20_000
 MAX_REASONING_CHARS = 8_000
-EDIT_INTERVAL_SECONDS = 1.0
 WATCHDOG_POLL_SECONDS = 30.0
 WATCHDOG_CONTINUATION = (
     "The previous turn was automatically interrupted because it produced no activity for "
@@ -1389,12 +1388,12 @@ Return exactly:
 
         async def update() -> None:
             elapsed = time.monotonic() - self.last_edit.get(room_id, 0.0)
-            if elapsed < EDIT_INTERVAL_SECONDS:
-                await asyncio.sleep(EDIT_INTERVAL_SECONDS - elapsed)
+            interval = self.settings.matrix_edit_interval_seconds
+            if elapsed < interval:
+                await asyncio.sleep(interval - elapsed)
             if state.in_flight_event_id:
                 text = self._progress_text(state)
                 await self.send_edit(room_id, state.in_flight_event_id, text)
-                self.last_edit[room_id] = time.monotonic()
 
         self.edit_tasks[room_id] = asyncio.create_task(update())
 
@@ -1638,6 +1637,7 @@ Return exactly:
                 room_id,
             )
             return None
+        self.last_edit[room_id] = time.monotonic()
         event_id = getattr(response, "event_id", None)
         LOG.debug("Matrix send response: %s", response)
         return str(event_id) if event_id else None
@@ -1656,6 +1656,7 @@ Return exactly:
                 content=content,
                 ignore_unverified_devices=self.settings.ignore_unverified_devices,
             )
+            self.last_edit[room_id] = time.monotonic()
         except OlmUnverifiedDeviceError:
             LOG.error("Cannot edit message in %s because the room has unverified devices", room_id)
 

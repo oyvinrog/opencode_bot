@@ -504,6 +504,7 @@ async def test_tool_progress_is_reported_without_tool_arguments(tmp_path: Path) 
     assert state.active_tools["tool-part"]["name"] == "bash"
     assert "input" not in state.active_tools["tool-part"]
 
+    bot.last_edit.clear()
     await bot.handle_opencode_event({
         "directory": str(tmp_path),
         "payload": {
@@ -516,6 +517,7 @@ async def test_tool_progress_is_reported_without_tool_arguments(tmp_path: Path) 
             },
         },
     })
+    await bot.edit_tasks["!one:example"]
     assert state.active_tools == {}
 
 
@@ -540,6 +542,42 @@ async def test_reasoning_phase_is_reported_without_reasoning_text(tmp_path: Path
     progress = matrix.room_send.await_args.kwargs["content"]["m.new_content"]["body"]
     assert "Reasoning" in progress
     assert "private internal reasoning" not in progress
+
+
+async def test_live_edits_respect_matrix_rate_limit_interval(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, _, _ = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$progress", prompt_started_ms=1
+    )
+    bot.last_edit["!one:example"] = 98.0
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.monotonic", lambda: 100.0)
+    sleep = AsyncMock()
+    monkeypatch.setattr("matrix_opencode_bot.bot.asyncio.sleep", sleep)
+
+    bot.schedule_live_edit("!one:example", state)
+    await bot.edit_tasks["!one:example"]
+
+    sleep.assert_awaited_once_with(3.0)
+
+
+async def test_initial_matrix_message_also_delays_first_live_edit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bot, _, _, _ = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1", str(tmp_path), in_flight_event_id="$progress", prompt_started_ms=1
+    )
+    monkeypatch.setattr("matrix_opencode_bot.bot.time.monotonic", lambda: 100.0)
+    sleep = AsyncMock()
+    monkeypatch.setattr("matrix_opencode_bot.bot.asyncio.sleep", sleep)
+
+    await bot.send_text("!one:example", "Working…")
+    bot.schedule_live_edit("!one:example", state)
+    await bot.edit_tasks["!one:example"]
+
+    sleep.assert_awaited_once_with(5.0)
 
 
 async def test_provider_reasoning_can_be_streamed_to_chat(tmp_path: Path) -> None:

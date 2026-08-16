@@ -125,7 +125,10 @@ inference. The verifier is instructed not to edit or take consequential actions;
 OpenCode's normal permissions still govern every tool call.
 
 Assistant text and safe progress are relayed through Matrix `m.replace` edits at
-most once per second. While busy, the progress message shows elapsed time, the
+most once per `MATRIX_EDIT_INTERVAL_SECONDS` (five seconds by default, to stay
+below typical homeserver rate limits). The interval is measured from every successful
+outgoing room message, so a live edit does not immediately follow a command reply,
+permission prompt, or initial progress message. While busy, the progress message shows elapsed time, the
 current plan item, plan completion, recent phases, tool names and status, retries,
 subagents, and file-update counts. Raw hidden reasoning, tool arguments, and
 commands are not posted; user-visible plan descriptions may mention files.

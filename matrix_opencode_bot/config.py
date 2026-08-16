@@ -57,6 +57,7 @@ class Settings:
     stuck_timeout_seconds: int = 900
     pursuit_stuck_timeout_seconds: int = 180
     pursuit_tool_timeout_seconds: int = 120
+    matrix_edit_interval_seconds: int = 5
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -115,6 +116,9 @@ class Settings:
             ),
             pursuit_tool_timeout_seconds=env_positive_int(
                 "OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS", 120
+            ),
+            matrix_edit_interval_seconds=env_positive_int(
+                "MATRIX_EDIT_INTERVAL_SECONDS", 5
             ),
         )
 
