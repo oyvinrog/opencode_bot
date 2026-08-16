@@ -172,7 +172,10 @@ async def test_removed_obsess_command_is_rejected(tmp_path: Path) -> None:
 async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> None:
     bot, matrix, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
-    opencode.create_session.return_value = {"id": "ses_verify", "title": "Verifier"}
+    opencode.create_session.side_effect = [
+        {"id": "ses_pursue", "title": "Pursuit worker"},
+        {"id": "ses_verify", "title": "Verifier"},
+    ]
 
     await bot.command_pursue("!one:example", "Find the root cause")
 
@@ -192,9 +195,9 @@ async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> 
     })
     assert state.pursuit_phase == "working"
     assert state.pursuit_iteration == 1
-    assert opencode.prompt_async.await_args.args[0] == "ses_1"
+    assert opencode.prompt_async.await_args.args[0] == "ses_pursue"
 
-    await pursuit_text_and_idle(bot, tmp_path, "ses_1", "The bug is in parser X.")
+    await pursuit_text_and_idle(bot, tmp_path, "ses_pursue", "The bug is in parser X.")
     assert state.pursuit_phase == "verifying"
     assert opencode.prompt_async.await_args.args[0] == "ses_verify"
 
@@ -263,7 +266,10 @@ async def test_pursuit_pauses_for_material_input_and_normal_reply_resumes(
 ) -> None:
     bot, _, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
-    opencode.create_session.return_value = {"id": "ses_verify"}
+    opencode.create_session.side_effect = [
+        {"id": "ses_pursue"},
+        {"id": "ses_verify"},
+    ]
     await bot.command_pursue("!one:example", "Find a suitable product")
 
     await pursuit_response(bot, tmp_path, "ses_verify", {
@@ -279,7 +285,7 @@ async def test_pursuit_pauses_for_material_input_and_normal_reply_resumes(
     await bot.prompt("!one:example", "Norway")
     assert state.pursuit_phase == "working"
     assert "User clarification: Norway" in state.pursuit_assumptions
-    assert opencode.prompt_async.await_args.args[0] == "ses_1"
+    assert opencode.prompt_async.await_args.args[0] == "ses_pursue"
 
 
 async def test_verifier_continue_records_feedback_and_replans(tmp_path: Path) -> None:
@@ -322,16 +328,44 @@ async def test_verifier_continue_records_feedback_and_replans(tmp_path: Path) ->
 async def test_invalid_verifier_envelope_is_hidden_and_repaired(tmp_path: Path) -> None:
     bot, matrix, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
-    opencode.create_session.return_value = {"id": "ses_verify"}
+    opencode.create_session.side_effect = [
+        {"id": "ses_pursue"},
+        {"id": "ses_verify"},
+    ]
     await bot.command_pursue("!one:example", "Research carefully")
 
     await pursuit_text_and_idle(bot, tmp_path, "ses_verify", "not valid control JSON")
     state = store.rooms["!one:example"]
     assert state.pursuit_protocol_failures == 1
     assert state.pursuit_phase == "specifying"
-    assert "prior response did not match" in opencode.prompt_async.await_args.args[2]
+    assert "malformed or contained placeholder" in opencode.prompt_async.await_args.args[2]
     visible = matrix.room_send.await_args_list[-2].kwargs["content"]["m.new_content"]["body"]
     assert "not valid control JSON" not in visible
+
+
+async def test_placeholder_acceptance_contract_is_rejected(tmp_path: Path) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_old", str(tmp_path))
+    opencode.create_session.side_effect = [
+        {"id": "ses_pursue"},
+        {"id": "ses_verify"},
+    ]
+    await bot.command_pursue("!one:example", "Research current jobs")
+
+    await pursuit_response(bot, tmp_path, "ses_verify", {
+        "type": "contract",
+        "criteria": ["specific mandatory criterion"],
+        "assumptions": ["assumption"],
+        "needs_input": False,
+        "question": None,
+    })
+
+    state = store.rooms["!one:example"]
+    assert state.session_id == "ses_pursue"
+    assert state.pursuit_phase == "specifying"
+    assert state.acceptance_criteria == []
+    assert state.pursuit_protocol_failures == 1
+    assert all(call.args[0] == "ses_verify" for call in opencode.prompt_async.await_args_list)
 
 
 async def test_three_identical_evidence_free_gaps_reset_worker_context(
@@ -427,7 +461,10 @@ async def test_pursuit_submission_error_retries_with_backoff(
 ) -> None:
     bot, _, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
-    opencode.create_session.return_value = {"id": "ses_verify"}
+    opencode.create_session.side_effect = [
+        {"id": "ses_pursue"},
+        {"id": "ses_verify"},
+    ]
     opencode.prompt_async.side_effect = [OpenCodeError("offline"), None]
     sleep = AsyncMock()
     monkeypatch.setattr("matrix_opencode_bot.bot.asyncio.sleep", sleep)
@@ -666,6 +703,35 @@ async def test_permission_is_scoped_to_matching_room_and_can_be_answered(tmp_pat
     assert "Allowed once" in matrix.room_send.await_args.kwargs["content"]["body"]
 
 
+async def test_current_permission_asked_schema_is_forwarded_to_matrix(
+    tmp_path: Path,
+) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+
+    await bot.handle_opencode_event({
+        "directory": str(tmp_path),
+        "payload": {
+            "type": "permission.asked",
+            "properties": {
+                "id": "per_external",
+                "sessionID": "ses_1",
+                "permission": "external_directory",
+                "patterns": ["/home/user/Documents/jobbsoek/*"],
+                "always": ["/home/user/Documents/jobbsoek/*"],
+            },
+        },
+    })
+
+    pending = store.rooms["!one:example"].pending_permissions
+    assert len(pending) == 1
+    assert pending[0].type == "external_directory"
+    assert pending[0].pattern == "/home/user/Documents/jobbsoek/*"
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "external_directory" in body
+    assert "!allow or !deny" in body
+
+
 async def test_permission_answers_oldest_request(tmp_path: Path) -> None:
     bot, _, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession(
@@ -849,6 +915,12 @@ async def test_pursuit_stalled_tool_is_quarantined_and_resumed_in_fresh_worker(
     await bot.watchdog_check()
 
     opencode.abort.assert_awaited_once_with("ses_poisoned", str(tmp_path))
+    alerts = [
+        call.kwargs["content"]["body"]
+        for call in bot.client.room_send.await_args_list
+        if "m.relates_to" not in call.kwargs["content"]
+    ]
+    assert any("Automatic recovery" in body and "tool bash" in body for body in alerts)
     assert state.session_id == "ses_recovered"
     assert state.pursuit_phase == "working"
     assert state.pursuit_iteration == 2
@@ -1086,6 +1158,43 @@ async def test_restored_pending_recovery_continues_when_idle(tmp_path: Path) -> 
     assert state.watchdog_recovery_pending is False
     assert state.watchdog_recovery_attempts == 2
     assert state.last_activity_ms is not None
+
+
+async def test_restart_quarantines_persisted_placeholder_contract(
+    tmp_path: Path,
+) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_poisoned",
+        str(tmp_path),
+        in_flight_event_id="$event",
+        prompt_started_ms=1,
+        pursuit_goal="Research jobs",
+        pursuit_phase="working",
+        pursuit_iteration=2,
+        verifier_session_id="ses_bad_verifier",
+        acceptance_criteria=["specific mandatory criterion"],
+        pursuit_assumptions=["assumption"],
+    )
+    store.rooms["!one:example"] = state
+    opencode.get_session.return_value = {"id": "ses_poisoned", "title": "Old"}
+    opencode.create_session.side_effect = [
+        {"id": "ses_recovered_worker", "title": "Recovered"},
+        {"id": "ses_recovered_verifier"},
+    ]
+
+    await bot.validate_restored_state()
+
+    opencode.abort.assert_awaited_once_with("ses_poisoned", str(tmp_path))
+    opencode.delete_session.assert_awaited_once_with(
+        "ses_bad_verifier", str(tmp_path)
+    )
+    assert state.session_id == "ses_recovered_worker"
+    assert state.verifier_session_id == "ses_recovered_verifier"
+    assert state.pursuit_phase == "specifying"
+    assert state.acceptance_criteria == []
+    assert state.pursuit_assumptions == []
+    assert state.in_flight_event_id is None
 
 
 async def test_watchdog_task_is_cancelled_on_close(tmp_path: Path) -> None:

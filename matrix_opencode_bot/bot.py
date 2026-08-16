@@ -342,6 +342,14 @@ class MatrixOpenCodeBot:
         if state.in_flight_event_id or status.get("type") != "idle":
             await self.send_text(room_id, "This session is busy. Wait for it to finish or use !stop.")
             return
+        if not created:
+            # A pursuit should not inherit an arbitrarily large or previously poisoned chat
+            # transcript. The goal and durable pursuit state are the context it actually needs.
+            worker = await self.opencode.create_session(
+                state.directory, title="Matrix OpenCode pursuit worker"
+            )
+            state.session_id = str(worker["id"])
+            state.title = str(worker.get("title") or state.title)
         verifier = await self.opencode.create_session(
             state.directory, title="Matrix pursuit verifier"
         )
@@ -391,9 +399,11 @@ User clarifications already received:
 {clarification}
 
 Infer harmless details. Ask for input only if a missing fact would materially change the result.
-Return exactly:
-<pursuit-control>{{"type":"contract","criteria":["specific mandatory criterion"],"assumptions":["assumption"],"needs_input":false,"question":null}}</pursuit-control>
-Criteria must be task-aware and objectively checkable where possible. Do not perform the task yet."""
+Return exactly one tagged JSON object with this shape:
+<pursuit-control>{{"type":"contract","criteria":["<concrete criterion derived from the goal>"],"assumptions":["<explicit harmless assumption, or use an empty array>"],"needs_input":false,"question":null}}</pursuit-control>
+Replace every angle-bracketed instruction with goal-specific content; copied placeholders make the
+contract invalid. Criteria must be task-aware, mandatory, and objectively checkable where possible.
+Normally provide 2-6 non-overlapping criteria. Do not perform the task yet."""
 
     @staticmethod
     def _worker_prompt(state: RoomSession, *, reset: bool = False) -> str:
@@ -428,7 +438,9 @@ Current unresolved gap: {state.pursuit_gap or "Start with the highest-value unre
 Act, observe real tool or source feedback, and verify your own work. Do not declare the overall
 goal complete; the separate verifier decides that. End with a concise report containing actions,
 new evidence, unresolved gaps, and failures. For research, include direct source URLs and separate
-sourced facts from inference."""
+sourced facts from inference. Keep tool calls small, bounded, and independently checkable. Never
+combine web research, parsing, and deliverable creation in one giant shell or Python command. Give
+shell and network operations explicit timeouts, and prefer dedicated search/fetch/write tools."""
 
     @staticmethod
     def _verification_prompt(state: RoomSession) -> str:
@@ -607,7 +619,7 @@ Return exactly:
         await self.finalize(
             room_id,
             state,
-            f"Verifier returned an invalid control envelope; repairing format "
+            f"Verifier returned an invalid control envelope or placeholder contract; repairing "
             f"({state.pursuit_protocol_failures}/3).",
         )
         if state.pursuit_protocol_failures >= 3:
@@ -620,8 +632,9 @@ Return exactly:
             )
         else:
             prompt = (
-                "Your prior response did not match the required schema. Return only the exact "
-                "tagged JSON envelope requested previously. Invalid response follows:\n" + raw[-4000:]
+                "Your prior response was malformed or contained placeholder/example content. "
+                "Return only the exact tagged JSON envelope requested previously, with concrete "
+                "goal-specific values. Invalid response follows:\n" + raw[-4000:]
             )
         await self.store.save()
         await self._submit_verifier(room_id, state, prompt)
@@ -1090,6 +1103,20 @@ Return exactly:
             f"(attempt {state.watchdog_recovery_attempts})"
         )
         await self.store.save()
+        if not recovery_retry:
+            if state.recovery_reason == "tool_timeout":
+                alert = (
+                    f"⚠️ Automatic recovery: pursuit tool "
+                    f"{state.recovery_tool or 'tool'} exceeded "
+                    f"{self.settings.pursuit_tool_timeout_seconds}s. Aborting the stalled "
+                    "session and continuing the same phase in a fresh session."
+                )
+            else:
+                alert = (
+                    f"⚠️ Automatic recovery: no observable activity for {silence_timeout}s. "
+                    "Aborting the stalled turn and continuing automatically."
+                )
+            await self.send_text(room_id, alert)
         if state.in_flight_event_id:
             await self.send_edit(
                 room_id, state.in_flight_event_id, self._progress_text(state)
@@ -1226,22 +1253,28 @@ Return exactly:
                 await self.store.save()
             self._touch_activity(state)
 
-        if event_type == "permission.updated":
+        if event_type in {"permission.updated", "permission.asked"}:
             permission_id = str(properties.get("id", ""))
             if not permission_id or any(p.id == permission_id for p in state.pending_permissions):
                 return
-            pattern_value = properties.get("pattern", "")
+            pattern_value = properties.get("patterns", properties.get("pattern", ""))
             if isinstance(pattern_value, list):
                 pattern = ", ".join(map(str, pattern_value))
             else:
                 pattern = str(pattern_value or "")
+            permission_type = str(
+                properties.get("permission") or properties.get("type") or "unknown"
+            )
             pending = PendingPermission(
                 id=permission_id,
-                title=str(properties.get("title") or properties.get("type") or "Permission request"),
-                type=str(properties.get("type") or "unknown"),
+                title=str(properties.get("title") or permission_type or "Permission request"),
+                type=permission_type,
                 pattern=pattern[:500],
-                created=_integer((properties.get("time") or {}).get("created")),
-                session_id=self._active_session_id(state),
+                created=(
+                    _integer((properties.get("time") or {}).get("created"))
+                    or int(time.time() * 1000)
+                ),
+                session_id=str(properties.get("sessionID") or self._active_session_id(state)),
             )
             state.pending_permissions.append(pending)
             await self.store.save()
@@ -1536,6 +1569,50 @@ Return exactly:
                     if title != state.title:
                         state.title = title
                         changed = True
+                    invalid_persisted_contract = bool(
+                        state.pursuit_goal
+                        and state.acceptance_criteria
+                        and (
+                            len(state.acceptance_criteria)
+                            != len(set(state.acceptance_criteria))
+                            or any(
+                                _is_placeholder_contract_text(item)
+                                for item in state.acceptance_criteria
+                            )
+                        )
+                    )
+                    if invalid_persisted_contract:
+                        active_session = self._active_session_id(state)
+                        if state.in_flight_event_id:
+                            with contextlib.suppress(OpenCodeError):
+                                await self.opencode.abort(active_session, state.directory)
+                            await self.finalize(
+                                room_id,
+                                state,
+                                "Invalid placeholder acceptance contract detected after restart; "
+                                "quarantining its context and generating a concrete contract.",
+                            )
+                        worker = await self.opencode.create_session(
+                            state.directory,
+                            title="Matrix OpenCode pursuit worker (contract recovery)",
+                        )
+                        state.session_id = str(worker["id"])
+                        state.title = str(worker.get("title") or state.title)
+                        await self._replace_verifier(state)
+                        state.acceptance_criteria.clear()
+                        state.pursuit_criteria_status.clear()
+                        state.pursuit_assumptions = [
+                            item
+                            for item in state.pursuit_assumptions
+                            if not _is_placeholder_contract_text(item)
+                        ]
+                        state.pursuit_phase = "specifying"
+                        state.pursuit_protocol_failures = 0
+                        state.pursuit_reflections.append(
+                            "A persisted placeholder contract was rejected during restart recovery."
+                        )
+                        state.pursuit_reflections = state.pursuit_reflections[-10:]
+                        changed = True
                     if state.pursuit_goal and state.verifier_session_id:
                         try:
                             await self.opencode.get_session(
@@ -1733,20 +1810,36 @@ def _parse_pursuit_control(text: str, phase: str | None) -> dict[str, Any] | Non
         assumptions = value.get("assumptions")
         needs_input = value.get("needs_input")
         question = value.get("question")
+        normalized_criteria = (
+            [item.strip() for item in criteria]
+            if isinstance(criteria, list)
+            and all(isinstance(item, str) for item in criteria)
+            else []
+        )
+        normalized_assumptions = (
+            [item.strip() for item in assumptions if item.strip()]
+            if isinstance(assumptions, list)
+            and all(isinstance(item, str) for item in assumptions)
+            else []
+        )
         if (
             value.get("type") != "contract"
             or not isinstance(criteria, list)
             or not criteria
             or not all(isinstance(item, str) and item.strip() for item in criteria)
+            or len(normalized_criteria) != len(set(normalized_criteria))
+            or any(_is_placeholder_contract_text(item) for item in normalized_criteria)
             or not isinstance(assumptions, list)
             or not all(isinstance(item, str) for item in assumptions)
+            or any(_is_placeholder_contract_text(item) for item in normalized_assumptions)
             or not isinstance(needs_input, bool)
             or (needs_input and (not isinstance(question, str) or not question.strip()))
+            or (not needs_input and not (question is None or question == ""))
         ):
             return None
         return {
-            "criteria": [item.strip() for item in criteria],
-            "assumptions": [item.strip() for item in assumptions if item.strip()],
+            "criteria": normalized_criteria,
+            "assumptions": normalized_assumptions,
             "needs_input": needs_input,
             "question": question.strip() if isinstance(question, str) else None,
         }
@@ -1791,8 +1884,28 @@ def _parse_pursuit_control(text: str, phase: str | None) -> dict[str, Any] | Non
     }
 
 
+def _is_placeholder_contract_text(value: str) -> bool:
+    normalized = " ".join(value.lower().split()).strip(" .:-_")
+    if not normalized or "<" in value or ">" in value:
+        return True
+    exact_placeholders = {
+        "assumption",
+        "criterion",
+        "criteria",
+        "specific mandatory criterion",
+        "mandatory criterion",
+        "acceptance criterion",
+        "example",
+        "placeholder",
+        "tbd",
+        "todo",
+        "none",
+    }
+    return normalized in exact_placeholders or normalized.startswith("replace with ")
+
+
 def _event_session_id(event_type: Any, properties: dict[str, Any]) -> str | None:
-    if event_type == "permission.updated":
+    if event_type in {"permission.updated", "permission.asked"}:
         value = properties.get("sessionID")
     elif event_type == "message.part.updated":
         part = properties.get("part", {})

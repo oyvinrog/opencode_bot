@@ -106,8 +106,11 @@ session is busy. New sessions also leave earlier OpenCode sessions and their
 changes intact.
 
 Starting a session posts a compact reminder of the available commands. `!pursue`
-first creates a separate verifier session that freezes task-aware acceptance
-criteria. A worker then acts in repeated passes while the verifier independently
+starts a fresh worker when the room already has a session, preventing a large or
+poisoned ordinary-chat transcript from contaminating the pursuit. It also creates
+a separate verifier session that freezes task-aware acceptance criteria. Literal
+schema placeholders and duplicate criteria are rejected instead of becoming the
+contract. The worker then acts in repeated passes while the verifier independently
 checks evidence after every pass. The pursuit completes automatically only when
 all mandatory criteria pass. Material ambiguities pause for an ordinary Matrix
 reply; difficulty or lack of immediate progress does not stop the loop.
@@ -135,6 +138,12 @@ commands are not posted; user-visible plan descriptions may mention files.
 Permission requests and errors are sent immediately. Replies longer than 20,000
 characters are split at completion.
 
+Both the current OpenCode `permission.asked` event schema and the legacy
+`permission.updated` schema are normalized. This is especially important for
+`external_directory`: an operation targeting a path outside the session worktree
+is paused and surfaced in Matrix for `!allow` or `!deny`, rather than appearing as
+an indefinitely running tool.
+
 An in-process watchdog checks active bot-submitted prompts every 30 seconds.
 Ordinary turns use `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default).
 Pursuits use the shorter `OPENCODE_PURSUE_STUCK_TIMEOUT_SECONDS` (180 seconds),
@@ -150,6 +159,11 @@ the active deadline as a countdown. The watchdog also
 reconciles missed idle events and OpenCode's occasional stale `busy` status by
 requiring a completed timestamp on the latest assistant message before treating a
 busy response as finished.
+
+When a watchdog deadline is reached, the bot sends a new Matrix room message—not
+only a replacement edit—so clients can generate a notification for the recovery.
+External-directory and other permission requests likewise arrive as new messages
+with explicit `!allow` / `!deny` instructions.
 
 `!bump` exposes the same recovery mechanism under explicit user control. It
 reports time since the last observable activity and compares it with the watchdog
