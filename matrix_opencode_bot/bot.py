@@ -70,7 +70,6 @@ Ordinary messages — prompt the current session, creating one if needed
 !status — show current activity
 !diagnose — write a detailed DIAGNOSIS.txt in the session directory
 !bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
-!allow / !deny — answer the oldest permission request
 !diff — show changed files
 !stop — stop a pursuit and abort the current operation
 !reset — discard the room-to-session mapping
@@ -78,7 +77,7 @@ Ordinary messages — prompt the current session, creating one if needed
 
 SESSION_REMINDER = (
     "Commands: !new [directory], !pursue <goal>, !status, !diagnose, !bump, !diff, "
-    "!allow, !deny, !stop, !reset, !help"
+    "!stop, !reset, !help"
 )
 
 DIAGNOSTIC_SECRET_KEY = re.compile(
@@ -150,7 +149,11 @@ class MatrixOpenCodeBot:
         command, _, argument = body.partition(" ")
         command = command.lower()
         try:
-            if command == "!help":
+            state = self.store.rooms.get(room_id)
+            has_pending_permission = bool(state and state.pending_permissions)
+            if command in {"y", "n"} and not argument and has_pending_permission:
+                await self.command_permission(room_id, "once" if command == "y" else "reject")
+            elif command == "!help":
                 await self.send_text(room_id, HELP)
             elif command == "!new":
                 await self.command_new(room_id, argument.strip() or None)
@@ -981,7 +984,7 @@ Return exactly:
                 await self.store.save()
                 await self.send_text(
                     room_id,
-                    "The turn is waiting for permission, not stalled. Use !allow or !deny.",
+                    "The turn is waiting for permission, not stalled. Reply with y or n.",
                 )
                 return
             if (await self._status(state)).get("type") == "idle":
@@ -1032,7 +1035,7 @@ Return exactly:
         if state.pending_permissions:
             await self.send_text(
                 room_id,
-                "The turn is waiting for permission, not stalled. Use !allow or !deny.",
+                "The turn is waiting for permission, not stalled. Reply with y or n.",
             )
             return
         if (await self._status(state)).get("type") == "idle":
@@ -1482,7 +1485,7 @@ Return exactly:
             message = f"OpenCode requests permission: {pending.title}\nType: {pending.type}"
             if pending.pattern:
                 message += f"\nPattern: {pending.pattern}"
-            message += "\nReply with !allow or !deny."
+            message += "\nReply with y or n."
             await self.send_text(room_id, message)
             return
 

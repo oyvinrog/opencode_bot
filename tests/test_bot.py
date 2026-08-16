@@ -951,7 +951,42 @@ async def test_current_permission_asked_schema_is_forwarded_to_matrix(
     assert pending[0].pattern == "/home/user/Documents/jobbsoek/*"
     body = matrix.room_send.await_args.kwargs["content"]["body"]
     assert "external_directory" in body
-    assert "!allow or !deny" in body
+    assert "Reply with y or n" in body
+
+
+async def test_y_and_n_answer_pending_permissions(tmp_path: Path) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    state = RoomSession(
+        "ses_1",
+        str(tmp_path),
+        pending_permissions=[PendingPermission("allow", "Allow", "bash", created=1)],
+    )
+    store.rooms["!one:example"] = state
+
+    await bot.on_message(room(), message(bot, "y"))
+
+    opencode.reply_permission.assert_awaited_once_with(
+        "ses_1", "allow", str(tmp_path), "once"
+    )
+
+    state.pending_permissions = [PendingPermission("deny", "Deny", "bash", created=2)]
+    opencode.reply_permission.reset_mock()
+
+    await bot.on_message(room(), message(bot, "N"))
+
+    opencode.reply_permission.assert_awaited_once_with(
+        "ses_1", "deny", str(tmp_path), "reject"
+    )
+
+
+async def test_y_without_pending_permission_remains_an_ordinary_prompt(tmp_path: Path) -> None:
+    bot, _, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+
+    await bot.on_message(room(), message(bot, "y"))
+
+    opencode.prompt_async.assert_awaited_once_with("ses_1", str(tmp_path), "y")
+    opencode.reply_permission.assert_not_awaited()
 
 
 async def test_permission_answers_oldest_request(tmp_path: Path) -> None:

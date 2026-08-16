@@ -93,8 +93,6 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!diagnose` — write `DIAGNOSIS.txt` in the mapped session directory
 - `!bump` — report inactivity and ask before restarting the same stalled turn
 - `!bump confirm` / `!bump cancel` — approve or cancel the proposed restart
-- `!allow` — allow the oldest pending permission once
-- `!deny` — reject the oldest pending permission
 - `!diff` — show unified diffs for the session
 - `!stop` — abort the current operation
 - `!reset` — discard only the room mapping
@@ -151,8 +149,9 @@ characters are split at completion.
 Both the current OpenCode `permission.asked` event schema and the legacy
 `permission.updated` schema are normalized. This is especially important for
 `external_directory`: an operation targeting a path outside the session worktree
-is paused and surfaced in Matrix for `!allow` or `!deny`, rather than appearing as
-an indefinitely running tool.
+is paused and surfaced in Matrix for `y` or `n`, rather than appearing as
+an indefinitely running tool. These replies are interpreted as permission answers
+only while the room has a pending request; otherwise they remain ordinary messages.
 
 An in-process watchdog checks active bot-submitted prompts every 30 seconds.
 Ordinary turns use `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default).
@@ -173,14 +172,14 @@ busy response as finished.
 When a watchdog deadline is reached, the bot sends a new Matrix room message—not
 only a replacement edit—so clients can generate a notification for the recovery.
 External-directory and other permission requests likewise arrive as new messages
-with explicit `!allow` / `!deny` instructions.
+with explicit `y` / `n` instructions.
 
 `!bump` exposes the same recovery mechanism under explicit user control. It
 reports time since the last observable activity and compares it with the watchdog
 threshold, but never interrupts immediately. `!bump confirm` aborts and resumes
 only if the same turn has remained unchanged; any intervening activity expires the
 confirmation. During a pursuit, a confirmed bump also quarantines the active
-session before resuming. Turns waiting for `!allow` or `!deny` are not considered
+session before resuming. Turns waiting for `y` or `n` are not considered
 stalled.
 
 Set `MATRIX_SHOW_REASONING=true` to also stream the provider-exposed reasoning
