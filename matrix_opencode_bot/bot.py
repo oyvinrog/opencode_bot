@@ -10,10 +10,14 @@ import getpass
 import json
 import logging
 import os
+import platform
 import re
 import stat
+import tempfile
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +68,7 @@ HELP = """Matrix–OpenCode commands:
 Ordinary messages — prompt the current session, creating one if needed
 !pursue <goal> — pursue a goal until independently verified or !stop
 !status — show current activity
+!diagnose — write a detailed DIAGNOSIS.txt in the session directory
 !bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
 !allow / !deny — answer the oldest permission request
 !diff — show changed files
@@ -72,8 +77,16 @@ Ordinary messages — prompt the current session, creating one if needed
 !help — show this message"""
 
 SESSION_REMINDER = (
-    "Commands: !new [directory], !pursue <goal>, !status, !bump, !diff, !allow, !deny, "
-    "!stop, !reset, !help"
+    "Commands: !new [directory], !pursue <goal>, !status, !diagnose, !bump, !diff, "
+    "!allow, !deny, !stop, !reset, !help"
+)
+
+DIAGNOSTIC_SECRET_KEY = re.compile(
+    r"(^|[_-])(access[_-]?token|authorization|cookie|credential|password|secret|api[_-]?key)($|[_-])",
+    re.IGNORECASE,
+)
+DIAGNOSTIC_SECRET_VALUE = re.compile(
+    r"(?i)\b(password|token|secret|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,;]+)"
 )
 
 
@@ -96,6 +109,9 @@ class MatrixOpenCodeBot:
         self.retry_tasks: dict[str, asyncio.Task[None]] = {}
         self.last_edit: dict[str, float] = {}
         self.watchdog_task: asyncio.Task[None] | None = None
+        self.diagnostic_events: defaultdict[str, deque[dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=200)
+        )
 
     def room_allowed(self, room: MatrixRoom) -> bool:
         return room.room_id in self.settings.allowed_rooms
@@ -140,6 +156,8 @@ class MatrixOpenCodeBot:
                 await self.command_new(room_id, argument.strip() or None)
             elif command == "!status":
                 await self.command_status(room_id)
+            elif command == "!diagnose":
+                await self.command_diagnose(room_id)
             elif command == "!bump":
                 await self.command_bump(room_id, argument.strip().lower())
             elif command == "!pursue":
@@ -772,6 +790,134 @@ Return exactly:
         )
         await self.send_text(room_id, "\n".join(lines))
 
+    async def command_diagnose(self, room_id: str) -> None:
+        """Write a bounded, credential-redacted snapshot for offline troubleshooting."""
+
+        state = self.store.rooms.get(room_id)
+        directory = Path(state.directory) if state else self.settings.default_directory
+        generated = datetime.now(timezone.utc).isoformat()
+        try:
+            package_version = version("matrix-opencode-bot")
+        except PackageNotFoundError:
+            package_version = "unknown"
+
+        report: dict[str, Any] = {
+            "format": "matrix-opencode-diagnosis-v1",
+            "generated_utc": generated,
+            "privacy_warning": (
+                "Credential-shaped fields were redacted automatically. Prompts, model output, "
+                "tool output, file paths, and diffs can still contain private data; inspect this "
+                "file before sharing it."
+            ),
+            "runtime": {
+                "bot_version": package_version,
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "bot_uptime_seconds": max(0, (int(time.time() * 1000) - self.started_ms) // 1000),
+            },
+            "configuration": {
+                "homeserver": self.settings.homeserver,
+                "matrix_user_id": self.settings.user_id,
+                "require_encryption": self.settings.require_encryption,
+                "ignore_unverified_devices": self.settings.ignore_unverified_devices,
+                "opencode_url": self.settings.opencode_url,
+                "default_directory": str(self.settings.default_directory),
+                "allowed_roots": [str(item) for item in self.settings.allowed_roots],
+                "show_reasoning": self.settings.show_reasoning,
+                "stuck_timeout_seconds": self.settings.stuck_timeout_seconds,
+                "pursuit_stuck_timeout_seconds": self.settings.pursuit_stuck_timeout_seconds,
+                "pursuit_tool_timeout_seconds": self.settings.pursuit_tool_timeout_seconds,
+                "matrix_edit_interval_seconds": self.settings.matrix_edit_interval_seconds,
+            },
+            "room_id": room_id,
+            "persisted_state": state.to_dict() if state else None,
+            "transient_state": (
+                {
+                    "activity": state.activity,
+                    "activity_history": state.activity_history,
+                    "plan_items": state.plan_items,
+                    "active_tools": state.active_tools,
+                    "last_activity_ms": state.last_activity_ms,
+                    "text_parts": state.text_parts,
+                    "reasoning_parts": state.reasoning_parts,
+                    "stop_requested": state.stop_requested,
+                }
+                if state
+                else None
+            ),
+            "recent_opencode_events": list(self.diagnostic_events.get(room_id, ())),
+            "opencode": {},
+        }
+
+        async def capture(label: str, operation: Any) -> None:
+            try:
+                report["opencode"][label] = await operation
+            except Exception as exc:  # Keep partial evidence when one diagnostic endpoint fails.
+                report["opencode"][label] = {
+                    "diagnostic_error": f"{type(exc).__name__}: {exc}"
+                }
+
+        await capture("health", self.opencode.health())
+        if state:
+            await capture("all_session_statuses", self.opencode.session_status(state.directory))
+            sessions = [
+                ("worker", state.session_id),
+                ("verifier", state.verifier_session_id),
+                ("recovery", state.recovery_session_id),
+            ]
+            seen: set[str] = set()
+            for role, session_id in sessions:
+                if not session_id or session_id in seen:
+                    continue
+                seen.add(session_id)
+                await capture(
+                    f"{role}_session",
+                    self.opencode.get_session(session_id, state.directory),
+                )
+                await capture(
+                    f"{role}_messages_last_100",
+                    self.opencode.messages(session_id, state.directory, limit=100),
+                )
+                await capture(
+                    f"{role}_diff",
+                    self.opencode.diff(session_id, state.directory),
+                )
+
+        sanitized = _sanitize_diagnostic(report)
+        rendered = (
+            "MATRIX OPENCODE DIAGNOSIS\n"
+            "Copy this entire file when requesting further diagnosis.\n\n"
+            + json.dumps(sanitized, indent=2, ensure_ascii=False)
+            + "\n"
+        )
+        path = directory / "DIAGNOSIS.txt"
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=directory,
+                prefix=".DIAGNOSIS.",
+                delete=False,
+            ) as temporary:
+                temporary_name = temporary.name
+                temporary.write(rendered)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.chmod(temporary_name, stat.S_IRUSR | stat.S_IWUSR)
+            os.replace(temporary_name, path)
+        except OSError as exc:
+            if temporary_name:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary_name)
+            await self.send_text(room_id, f"Could not write DIAGNOSIS.txt: {exc}")
+            return
+        await self.send_text(
+            room_id,
+            f"Wrote diagnostic report locally:\n{path}\n"
+            "Inspect it for private prompt/tool/file content, then copy and paste it for analysis.",
+        )
+
     async def command_bump(self, room_id: str, action: str) -> None:
         state = self.store.rooms.get(room_id)
         if not state:
@@ -1238,6 +1384,15 @@ Return exactly:
             async with self.room_locks[room_id]:
                 if session_id != self._active_session_id(state):
                     continue
+                self.diagnostic_events[room_id].append(
+                    {
+                        "observed_utc": datetime.now(timezone.utc).isoformat(),
+                        "type": str(event_type),
+                        "session_id": session_id,
+                        "directory": str(directory or state.directory),
+                        "properties": _sanitize_diagnostic(properties, max_string=4000),
+                    }
+                )
                 await self._handle_room_event(room_id, state, str(event_type), properties)
 
     async def _handle_room_event(
@@ -2014,6 +2169,36 @@ def _integer(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _sanitize_diagnostic(value: Any, *, max_string: int = 20_000) -> Any:
+    """Bound diagnostic data and redact values whose field names identify credentials."""
+
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            if DIAGNOSTIC_SECRET_KEY.search(key):
+                sanitized[key] = "[REDACTED]"
+            else:
+                sanitized[key] = _sanitize_diagnostic(item, max_string=max_string)
+        return sanitized
+    if isinstance(value, (list, tuple, deque)):
+        items = list(value)
+        sanitized_items = [
+            _sanitize_diagnostic(item, max_string=max_string) for item in items[:200]
+        ]
+        if len(items) > 200:
+            sanitized_items.append(f"[TRUNCATED {len(items) - 200} ITEMS]")
+        return sanitized_items
+    if isinstance(value, str):
+        redacted = DIAGNOSTIC_SECRET_VALUE.sub(r"\1\2[REDACTED]", value)
+        if len(redacted) > max_string:
+            return redacted[:max_string] + f"\n[TRUNCATED {len(redacted) - max_string} CHARACTERS]"
+        return redacted
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:max_string]
 
 
 def save_matrix_session(path: Path, response: LoginResponse, homeserver: str) -> None:

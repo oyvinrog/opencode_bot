@@ -90,6 +90,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - Ordinary messages — prompt the current session, creating one in the default directory if needed
 - `!pursue <goal>` — pursue a goal until independently verified or `!stop`
 - `!status` — show the session, directory, activity, permissions, and change totals
+- `!diagnose` — write `DIAGNOSIS.txt` in the mapped session directory
 - `!bump` — report inactivity and ask before restarting the same stalled turn
 - `!bump confirm` / `!bump cancel` — approve or cancel the proposed restart
 - `!allow` — allow the oldest pending permission once
@@ -104,6 +105,14 @@ different workspace. One prompt at a time is accepted per room. `!reset` neither
 deletes the OpenCode session nor reverts files, and it is refused while the
 session is busy. New sessions also leave earlier OpenCode sessions and their
 changes intact.
+
+`!diagnose` snapshots the mapped room state, transient progress, the last 200
+OpenCode events observed since the bot started, server health/status, and up to
+100 recent messages plus diffs for the worker, verifier, and quarantined recovery
+sessions. The report is written atomically with owner-only permissions and the bot
+replies with its absolute path. Credential-shaped fields and assignments are
+redacted, but arbitrary prompts, model/tool output, paths, and source diffs can
+still contain private data. Inspect `DIAGNOSIS.txt` before copying or sharing it.
 
 Starting a session posts a compact reminder of the available commands. `!pursue`
 starts a fresh worker when the room already has a session, preventing a large or

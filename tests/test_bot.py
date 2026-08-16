@@ -40,6 +40,7 @@ def make_bot(tmp_path: Path, *, show_reasoning: bool = False):
 
     matrix = SimpleNamespace(user_id="@bot:example", room_send=AsyncMock(side_effect=room_send))
     opencode = SimpleNamespace(
+        health=AsyncMock(return_value={"healthy": True, "version": "test"}),
         session_status=AsyncMock(return_value={}),
         create_session=AsyncMock(return_value={"id": "ses_1", "title": "Matrix"}),
         prompt_async=AsyncMock(),
@@ -159,7 +160,41 @@ async def test_new_session_includes_command_reminder(tmp_path: Path) -> None:
     assert "!new [directory]" in body
     assert "!pursue <goal>" in body
     assert "!bump" in body
+    assert "!diagnose" in body
     assert "!obsess" not in body
+
+
+async def test_diagnose_writes_redacted_local_report(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession("ses_1", str(tmp_path), pursuit_goal="Investigate failure")
+    state.activity = "Using tool: bash"
+    store.rooms["!one:example"] = state
+    opencode.messages.return_value = [
+        {
+            "info": {"role": "assistant", "access_token": "never-share-this"},
+            "parts": [
+                {
+                    "type": "text",
+                    "text": "password=hunter2 command failed with exit 1",
+                }
+            ],
+        }
+    ]
+
+    await bot.on_message(room(), message(bot, "!diagnose"))
+
+    report_path = tmp_path / "DIAGNOSIS.txt"
+    assert report_path.exists()
+    report = report_path.read_text(encoding="utf-8")
+    assert "MATRIX OPENCODE DIAGNOSIS" in report
+    assert "Investigate failure" in report
+    assert "Using tool: bash" in report
+    assert "never-share-this" not in report
+    assert "hunter2" not in report
+    assert "[REDACTED]" in report
+    assert report_path.stat().st_mode & 0o777 == 0o600
+    opencode.messages.assert_awaited_once_with("ses_1", str(tmp_path), limit=100)
+    assert str(report_path) in matrix.room_send.await_args.kwargs["content"]["body"]
 
 
 async def test_removed_obsess_command_is_rejected(tmp_path: Path) -> None:
