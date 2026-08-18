@@ -192,9 +192,9 @@ Automatic approvals do not override permissions OpenCode explicitly denies.
 
 An in-process watchdog checks active bot-submitted prompts every 30 seconds.
 Ordinary turns use `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default).
-Pursuits use the shorter `OPENCODE_PURSUE_STUCK_TIMEOUT_SECONDS` (180 seconds),
+Pursuits use the shorter `OPENCODE_PURSUE_STUCK_TIMEOUT_SECONDS` (600 seconds),
 and a pursuit tool continuously reported as running has its own hard ceiling,
-`OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS` (120 seconds). A timeout aborts the turn,
+`OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS` (300 seconds). A timeout aborts the turn,
 quarantines the poisoned pursuit worker or verifier session, and resumes the same
 phase in a fresh session with a durable warning not to repeat the failed approach.
 Each repeated recovery requires another full timeout, and `!stop` cancels automatic

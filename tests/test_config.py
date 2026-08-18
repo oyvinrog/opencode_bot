@@ -24,8 +24,8 @@ def test_settings_parse_required_values(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert settings.opencode_url == "http://127.0.0.1:4096"
     assert settings.show_reasoning is False
     assert settings.stuck_timeout_seconds == 900
-    assert settings.pursuit_stuck_timeout_seconds == 180
-    assert settings.pursuit_tool_timeout_seconds == 120
+    assert settings.pursuit_stuck_timeout_seconds == 600
+    assert settings.pursuit_tool_timeout_seconds == 300
     assert settings.pursuit_context_input_tokens == 250_000
     assert settings.matrix_edit_interval_seconds == 5
 
