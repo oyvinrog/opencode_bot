@@ -20,6 +20,7 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
             yolo_permissions=True,
             pending_pursuit_goal="Await a depth choice",
             pending_pursuit_reuse_session=True,
+            pending_pursuit_yolo_confirmation=True,
             pursuit_goal="Investigate thoroughly",
             pursuit_extent=3,
             pursuit_phase="verifying",
@@ -54,6 +55,7 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
     assert restored.rooms["!room:example"].pursuit_goal == "Investigate thoroughly"
     assert restored.rooms["!room:example"].pending_pursuit_goal == "Await a depth choice"
     assert restored.rooms["!room:example"].pending_pursuit_reuse_session is True
+    assert restored.rooms["!room:example"].pending_pursuit_yolo_confirmation is True
     assert restored.rooms["!room:example"].pursuit_extent == 3
     assert restored.rooms["!room:example"].pursuit_iteration == 7
     assert restored.rooms["!room:example"].verifier_session_id == "ses_verify"
@@ -93,6 +95,17 @@ def test_legacy_obsession_migrates_to_pursuit(tmp_path: Path) -> None:
     assert state.pursuit_phase == "specifying"
     assert state.pursuit_iteration == 4
     assert state.yolo_permissions is False
+
+
+def test_existing_pending_pursuit_defaults_to_extent_stage(tmp_path: Path) -> None:
+    state = RoomSession.from_dict({
+        "session_id": "ses",
+        "directory": str(tmp_path),
+        "pending_pursuit_goal": "Already chose the old extent flow",
+    })
+
+    assert state.pending_pursuit_goal == "Already chose the old extent flow"
+    assert state.pending_pursuit_yolo_confirmation is False
 
 
 async def test_remove_persists_empty_mapping(tmp_path: Path) -> None:

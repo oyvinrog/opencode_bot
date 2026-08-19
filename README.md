@@ -104,7 +104,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!help` — show the command list
 - `!new [directory]` — create a new session, using the default directory when omitted
 - Ordinary messages — prompt the current session, creating one in the default directory if needed
-- `!pursue <goal>` — choose extent 1–3, then pursue until independently verified or `!stop`
+- `!pursue <goal>` — choose permission mode and extent 1–3, then pursue until independently verified or `!stop`
 - `!status` — show the session, directory, activity, permissions, and change totals
 - `!diagnose` — write `DIAGNOSIS.txt` in the mapped session directory
 - `!bump` — report inactivity and ask before restarting the same stalled turn
@@ -131,7 +131,10 @@ redacted, but arbitrary prompts, model/tool output, paths, and source diffs can
 still contain private data. Inspect `DIAGNOSIS.txt` before copying or sharing it.
 
 Starting a session posts a compact reminder of the available commands. `!pursue`
-first asks for an extent: `1` reaches the evidenced goal, `2` checks the important
+first asks whether to enable session-scoped YOLO mode, accepting `y` or `n`. A `y`
+automatically approves future permission requests for the mapped session, including
+the pursuit worker and verifier; `n` disables YOLO even if it was previously enabled.
+It then asks for an extent: `1` reaches the evidenced goal, `2` checks the important
 alternatives and contradictions, and `3` systematically exhausts every plausible
 avenue and may run for hours. After the choice, it starts a fresh worker, preventing
 a large or poisoned ordinary-chat transcript from contaminating the pursuit. It also creates
@@ -184,7 +187,9 @@ Both the current OpenCode `permission.asked` event schema and the legacy
 `external_directory`: an operation targeting a path outside the session worktree
 is paused and surfaced in Matrix for `y`, `n`, or `YOLO`, rather than appearing as
 an indefinitely running tool. These replies are interpreted as permission answers
-only while the room has a pending request; otherwise they remain ordinary messages.
+only while the room has a pending request. During `!pursue` setup, `y` and `n`
+instead answer the explicit YOLO question; outside those two states they remain
+ordinary messages.
 `YOLO` approves all currently pending requests and automatically answers future
 requests for the mapped session, including pursuit worker and verifier sessions.
 It survives bot restarts, but `!new` and `!reset` clear it; `!yolo off` disables it.

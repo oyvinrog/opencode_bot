@@ -32,6 +32,7 @@ def settings(tmp_path: Path, *, show_reasoning: bool = False) -> Settings:
         default_directory=work,
         allowed_roots=(work,),
         show_reasoning=show_reasoning,
+        pursuit_tool_timeout_seconds=120,
     )
 
 
@@ -282,6 +283,7 @@ async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> 
     ]
 
     await bot.command_pursue("!one:example", "Find the root cause")
+    await bot.prompt("!one:example", "n")
     await bot.prompt("!one:example", "1")
 
     state = store.rooms["!one:example"]
@@ -324,7 +326,26 @@ async def test_pursue_specifies_works_verifies_and_completes(tmp_path: Path) -> 
     assert "Pursuit complete" in final
 
 
-async def test_pursue_waits_for_extent_and_applies_exhaustive_mode(tmp_path: Path) -> None:
+async def test_pursue_in_new_room_starts_session_then_asks_for_yolo(
+    tmp_path: Path,
+) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+
+    await bot.command_pursue("!one:example", "Investigate")
+
+    state = store.rooms["!one:example"]
+    assert state.pending_pursuit_yolo_confirmation is True
+    assert state.pending_pursuit_reuse_session is True
+    assert "Started OpenCode session" in (
+        matrix.room_send.await_args_list[0].kwargs["content"]["body"]
+    )
+    assert "Use YOLO mode" in matrix.room_send.await_args_list[1].kwargs["content"]["body"]
+    opencode.prompt_async.assert_not_awaited()
+
+
+async def test_pursue_waits_for_yolo_then_extent_and_applies_exhaustive_mode(
+    tmp_path: Path,
+) -> None:
     bot, matrix, opencode, store = make_bot(tmp_path)
     store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
     opencode.create_session.side_effect = [
@@ -336,7 +357,18 @@ async def test_pursue_waits_for_extent_and_applies_exhaustive_mode(tmp_path: Pat
 
     state = store.rooms["!one:example"]
     assert state.pending_pursuit_goal == "Map the whole problem"
+    assert state.pending_pursuit_yolo_confirmation is True
     assert state.pursuit_goal is None
+    opencode.create_session.assert_not_awaited()
+    question = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "Use YOLO mode" in question
+    assert "entire mapped session" in question
+    assert "worker and verifier" in question
+
+    await bot.prompt("!one:example", "Y")
+
+    assert state.yolo_permissions is True
+    assert state.pending_pursuit_yolo_confirmation is False
     opencode.create_session.assert_not_awaited()
     question = matrix.room_send.await_args.kwargs["content"]["body"]
     assert "Reply with a number" in question
@@ -356,12 +388,68 @@ async def test_invalid_pursuit_extent_keeps_waiting(tmp_path: Path) -> None:
     store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
 
     await bot.command_pursue("!one:example", "Investigate")
+    await bot.prompt("!one:example", "n")
     await bot.prompt("!one:example", "very")
 
     state = store.rooms["!one:example"]
     assert state.pending_pursuit_goal == "Investigate"
     assert "Please reply with 1" in matrix.room_send.await_args.kwargs["content"]["body"]
     opencode.create_session.assert_not_awaited()
+
+
+async def test_invalid_pursuit_yolo_choice_keeps_waiting(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+
+    await bot.command_pursue("!one:example", "Investigate")
+    await bot.prompt("!one:example", "maybe")
+
+    state = store.rooms["!one:example"]
+    assert state.pending_pursuit_yolo_confirmation is True
+    assert state.pending_pursuit_goal == "Investigate"
+    assert "Please reply with y or n" in matrix.room_send.await_args.kwargs["content"]["body"]
+    opencode.create_session.assert_not_awaited()
+
+
+async def test_pursuit_no_disables_existing_yolo_mode(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession(
+        "ses_1", str(tmp_path), yolo_permissions=True
+    )
+
+    await bot.command_pursue("!one:example", "Investigate")
+    await bot.prompt("!one:example", "N")
+
+    state = store.rooms["!one:example"]
+    assert state.yolo_permissions is False
+    assert state.pending_pursuit_yolo_confirmation is False
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "Permission mode set to prompt" in body
+    assert "Reply with a number" in body
+    opencode.create_session.assert_not_awaited()
+
+
+async def test_pending_pursuit_setup_status_duplicate_and_stop(tmp_path: Path) -> None:
+    bot, matrix, opencode, store = make_bot(tmp_path)
+    state = RoomSession("ses_1", str(tmp_path))
+    store.rooms["!one:example"] = state
+
+    await bot.command_pursue("!one:example", "Investigate")
+    await bot.command_status("!one:example")
+    assert "awaiting YOLO choice" in matrix.room_send.await_args.kwargs["content"]["body"]
+
+    await bot.command_pursue("!one:example", "Another goal")
+    assert "awaiting its YOLO choice" in matrix.room_send.await_args.kwargs["content"]["body"]
+
+    await bot.prompt("!one:example", "n")
+    await bot.command_status("!one:example")
+    assert "awaiting extent" in matrix.room_send.await_args.kwargs["content"]["body"]
+
+    await bot.command_stop("!one:example")
+    assert state.pending_pursuit_goal is None
+    assert state.pending_pursuit_yolo_confirmation is False
+    assert "Pursuit stopped" in matrix.room_send.await_args.kwargs["content"]["body"]
+    opencode.prompt_async.assert_not_awaited()
 
 
 async def test_criterion_text_punctuation_is_not_part_of_verdict_protocol(
@@ -580,6 +668,7 @@ async def test_pursuit_pauses_for_material_input_and_normal_reply_resumes(
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Find a suitable product")
+    await bot.prompt("!one:example", "n")
     await bot.prompt("!one:example", "1")
 
     await pursuit_response(bot, tmp_path, "ses_verify", {
@@ -642,6 +731,7 @@ async def test_invalid_verifier_envelope_is_hidden_and_repaired(tmp_path: Path) 
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Research carefully")
+    await bot.prompt("!one:example", "n")
     await bot.prompt("!one:example", "1")
 
     await pursuit_text_and_idle(bot, tmp_path, "ses_verify", "not valid control JSON")
@@ -663,6 +753,7 @@ async def test_bare_verifier_json_is_accepted_when_it_is_the_entire_response(
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Research current jobs")
+    await bot.prompt("!one:example", "n")
     await bot.prompt("!one:example", "1")
 
     await pursuit_text_and_idle(
@@ -714,6 +805,7 @@ async def test_verifier_prompt_text_is_not_combined_with_assistant_contract(
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Research current jobs")
+    await bot.prompt("!one:example", "n")
     await bot.prompt("!one:example", "1")
 
     await bot.handle_opencode_event({
@@ -800,6 +892,7 @@ async def test_placeholder_acceptance_contract_is_rejected(tmp_path: Path) -> No
         {"id": "ses_verify"},
     ]
     await bot.command_pursue("!one:example", "Research current jobs")
+    await bot.prompt("!one:example", "n")
     await bot.prompt("!one:example", "1")
 
     await pursuit_response(bot, tmp_path, "ses_verify", {
@@ -1013,6 +1106,7 @@ async def test_pursuit_submission_error_retries_with_backoff(
     monkeypatch.setattr("matrix_opencode_bot.bot.asyncio.sleep", sleep)
 
     await bot.command_pursue("!one:example", "Keep trying")
+    await bot.prompt("!one:example", "n")
     await bot.prompt("!one:example", "1")
     await bot.retry_tasks["!one:example"]
 

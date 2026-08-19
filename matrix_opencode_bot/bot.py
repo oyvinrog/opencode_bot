@@ -88,7 +88,7 @@ def _pursuit_extent_instruction(extent: int) -> str:
 HELP = """Matrix–OpenCode commands:
 !new [directory] — start a session
 Ordinary messages — prompt the current session, creating one if needed
-!pursue <goal> — choose a search depth, then pursue until independently verified or !stop
+!pursue <goal> — choose permission mode and search depth, then pursue until verified or !stop
 !status — show current activity
 !diagnose — write a detailed DIAGNOSIS.txt in the session directory
 !bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
@@ -286,7 +286,10 @@ class MatrixOpenCodeBot:
                 await self.send_text(room_id, f"Cannot automatically start session: {exc}")
                 return
         if state.pending_pursuit_goal:
-            await self._select_pursuit_extent(room_id, state, text)
+            if state.pending_pursuit_yolo_confirmation:
+                await self._select_pursuit_yolo(room_id, state, text)
+            else:
+                await self._select_pursuit_extent(room_id, state, text)
             return
         if state.pursuit_goal and state.pursuit_phase == "waiting_input":
             await self._resume_pursuit_with_input(room_id, state, text)
@@ -391,9 +394,14 @@ class MatrixOpenCodeBot:
                 await self.send_text(room_id, f"Cannot automatically start session: {exc}")
                 return
         if state.pending_pursuit_goal:
+            awaiting = (
+                "its YOLO choice. Reply y or n"
+                if state.pending_pursuit_yolo_confirmation
+                else "its extent choice. Reply 1, 2, or 3"
+            )
             await self.send_text(
                 room_id,
-                "A pursuit is awaiting its extent choice. Reply 1, 2, or 3, or use !stop.",
+                f"A pursuit is awaiting {awaiting}, or use !stop.",
             )
             return
         if state.pursuit_goal:
@@ -407,6 +415,7 @@ class MatrixOpenCodeBot:
             return
         state.pending_pursuit_goal = goal
         state.pending_pursuit_reuse_session = created
+        state.pending_pursuit_yolo_confirmation = True
         await self.store.save()
         if created:
             await self.send_text(
@@ -414,14 +423,53 @@ class MatrixOpenCodeBot:
                 f"Started OpenCode session {state.session_id}\nDirectory: {state.directory}"
                 f"\n\n{SESSION_REMINDER}",
             )
+        await self._ask_pursuit_yolo(room_id)
+
+    async def _ask_pursuit_yolo(self, room_id: str, *, retry: bool = False) -> None:
+        introduction = (
+            "Please reply with y or n."
+            if retry
+            else "Use YOLO mode for this pursuit? Reply y or n."
+        )
         await self.send_text(
             room_id,
-            "How extensive should this pursuit be? Reply with a number:\n"
-            "1 — Reach the goal: stop once every acceptance criterion is evidenced.\n"
-            "2 — Turn most stones: search broadly, test alternatives, and check contradictions.\n"
-            "3 — Exhaustive (\u201cautistic mode\u201d): systematically turn every plausible stone; "
-            "this may run for hours.\n\nUse !stop to cancel.",
+            f"{introduction}\n"
+            "y — automatically approve future permission requests for the entire mapped "
+            "session, including pursuit worker and verifier sessions; this survives bot "
+            "restarts.\n"
+            "n — disable YOLO and prompt for each permission request.\n\n"
+            "Use !stop to cancel.",
         )
+
+    async def _ask_pursuit_extent(
+        self, room_id: str, *, permission_mode: str | None = None
+    ) -> None:
+        prefix = f"Permission mode set to {permission_mode}.\n\n" if permission_mode else ""
+        await self.send_text(
+            room_id,
+            prefix
+            + (
+                "How extensive should this pursuit be? Reply with a number:\n"
+                "1 — Reach the goal: stop once every acceptance criterion is evidenced.\n"
+                "2 — Turn most stones: search broadly, test alternatives, and check "
+                "contradictions.\n"
+                "3 — Exhaustive (\u201cautistic mode\u201d): systematically turn every plausible "
+                "stone; this may run for hours.\n\nUse !stop to cancel."
+            ),
+        )
+
+    async def _select_pursuit_yolo(
+        self, room_id: str, state: RoomSession, response: str
+    ) -> None:
+        choice = response.strip().lower()
+        if choice not in {"y", "n"}:
+            await self._ask_pursuit_yolo(room_id, retry=True)
+            return
+        state.yolo_permissions = choice == "y"
+        state.pending_pursuit_yolo_confirmation = False
+        await self.store.save()
+        mode = "YOLO (auto-approve)" if state.yolo_permissions else "prompt"
+        await self._ask_pursuit_extent(room_id, permission_mode=mode)
 
     async def _select_pursuit_extent(
         self, room_id: str, state: RoomSession, response: str
@@ -850,6 +898,7 @@ Return exactly:
     def _clear_pursuit(state: RoomSession) -> None:
         state.pending_pursuit_goal = None
         state.pending_pursuit_reuse_session = False
+        state.pending_pursuit_yolo_confirmation = False
         state.pursuit_goal = None
         state.pursuit_extent = 1
         state.pursuit_phase = None
@@ -932,10 +981,11 @@ Return exactly:
         elif state.bump_confirmation_session_id:
             lines.append("Manual bump: awaiting !bump confirm or !bump cancel")
         if state.pending_pursuit_goal:
-            lines.append(
-                f"Pursuit: awaiting extent (reply 1, 2, or 3) — "
-                f"{state.pending_pursuit_goal}"
-            )
+            if state.pending_pursuit_yolo_confirmation:
+                pending_setup = "awaiting YOLO choice (reply y or n)"
+            else:
+                pending_setup = "awaiting extent (reply 1, 2, or 3)"
+            lines.append(f"Pursuit: {pending_setup} — {state.pending_pursuit_goal}")
         if state.pursuit_goal:
             passed = sum(
                 1 for status_value in state.pursuit_criteria_status.values()

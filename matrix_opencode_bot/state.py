@@ -35,6 +35,7 @@ class RoomSession:
     yolo_permissions: bool = False
     pending_pursuit_goal: str | None = None
     pending_pursuit_reuse_session: bool = False
+    pending_pursuit_yolo_confirmation: bool = False
     pursuit_goal: str | None = None
     pursuit_extent: int = 1
     pursuit_phase: str | None = None
@@ -87,6 +88,9 @@ class RoomSession:
             "yolo_permissions": self.yolo_permissions,
             "pending_pursuit_goal": self.pending_pursuit_goal,
             "pending_pursuit_reuse_session": self.pending_pursuit_reuse_session,
+            "pending_pursuit_yolo_confirmation": (
+                self.pending_pursuit_yolo_confirmation
+            ),
             "pursuit_goal": self.pursuit_goal,
             "pursuit_extent": self.pursuit_extent,
             "pursuit_phase": self.pursuit_phase,
@@ -146,6 +150,9 @@ class RoomSession:
             ),
             pending_pursuit_reuse_session=bool(
                 value.get("pending_pursuit_reuse_session", False)
+            ),
+            pending_pursuit_yolo_confirmation=bool(
+                value.get("pending_pursuit_yolo_confirmation", False)
             ),
             pursuit_goal=str(pursuit_goal) if pursuit_goal else None,
             pursuit_extent=_pursuit_extent(value.get("pursuit_extent")),
