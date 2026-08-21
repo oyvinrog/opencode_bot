@@ -188,6 +188,7 @@ async def test_new_session_includes_command_reminder(tmp_path: Path) -> None:
     assert "!pursue <goal>" in body
     assert "!bump" in body
     assert "!diagnose" in body
+    assert "!send" in body
     assert "!obsess" not in body
 
 
@@ -231,6 +232,67 @@ async def test_startup_logo_uses_plain_media_for_unencrypted_room(tmp_path: Path
     content = matrix.room_send.await_args.kwargs["content"]
     assert content["url"] == "mxc://example/logo"
     assert "file" not in content
+
+
+async def test_send_finds_and_uploads_unique_file_encrypted(tmp_path: Path) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    document = tmp_path / "reports" / "myfile.pdf"
+    document.parent.mkdir()
+    document.write_bytes(b"a small pdf")
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+    matrix.rooms = {"!one:example": SimpleNamespace(encrypted=True)}
+    matrix.upload.return_value = (
+        SimpleNamespace(content_uri="mxc://example/document"),
+        {"key": {"kty": "oct", "k": "secret"}, "iv": "iv", "hashes": {}},
+    )
+
+    await bot.on_message(room(), message(bot, "!send myfile.pdf"))
+
+    assert matrix.upload.await_args.kwargs == {
+        "content_type": "application/pdf",
+        "filename": "myfile.pdf",
+        "encrypt": True,
+        "filesize": len(b"a small pdf"),
+    }
+    content = matrix.room_send.await_args.kwargs["content"]
+    assert content["msgtype"] == "m.file"
+    assert content["body"] == "myfile.pdf"
+    assert content["file"]["url"] == "mxc://example/document"
+    assert "url" not in content
+
+
+async def test_send_suggests_relative_paths_when_filename_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    for folder in ("drafts", "final"):
+        path = tmp_path / folder / "report.pdf"
+        path.parent.mkdir()
+        path.write_bytes(folder.encode())
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+
+    await bot.on_message(room(), message(bot, "!send report.pdf"))
+
+    matrix.upload.assert_not_awaited()
+    body = matrix.room_send.await_args.kwargs["content"]["body"]
+    assert "!send drafts/report.pdf" in body
+    assert "!send final/report.pdf" in body
+
+    matrix.rooms = {"!one:example": SimpleNamespace(encrypted=False)}
+    matrix.upload.return_value = (SimpleNamespace(content_uri="mxc://example/report"), None)
+    await bot.on_message(room(), message(bot, "!send final/report.pdf"))
+    assert matrix.upload.await_args.kwargs["encrypt"] is False
+    assert matrix.room_send.await_args.kwargs["content"]["url"] == "mxc://example/report"
+
+
+async def test_send_rejects_paths_outside_workspace(tmp_path: Path) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    store.rooms["!one:example"] = RoomSession("ses_1", str(tmp_path))
+
+    await bot.on_message(room(), message(bot, "!send ../secret.pdf"))
+
+    matrix.upload.assert_not_awaited()
+    assert "No file matching" in matrix.room_send.await_args.kwargs["content"]["body"]
 
 
 async def test_diagnose_writes_redacted_local_report(tmp_path: Path) -> None:

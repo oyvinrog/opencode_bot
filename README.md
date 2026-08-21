@@ -109,6 +109,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!diagnose` — write `DIAGNOSIS.txt` in the mapped session directory
 - `!bump` — report inactivity and ask before restarting the same stalled turn
 - `!bump confirm` / `!bump cancel` — approve or cancel the proposed restart
+- `!send <filename>` — find and send a file from the mapped session directory
 - `!yolo off` — disable session-scoped automatic permission approval
 - `!diff` — show unified diffs for the session
 - `!stop` — abort the current operation
@@ -120,6 +121,14 @@ different workspace. One prompt at a time is accepted per room. `!reset` neither
 deletes the OpenCode session nor reverts files, and it is refused while the
 session is busy. New sessions also leave earlier OpenCode sessions and their
 changes intact.
+
+`!send` searches recursively and case-insensitively within the room's mapped
+session directory. A unique exact filename is uploaded immediately as native
+Matrix file media; ambiguous or partial matches produce up to ten relative-path
+commands that can be copied back into chat to select the intended file. In an
+unmapped room, the search uses `OPENCODE_DEFAULT_DIRECTORY`. Path traversal and
+symlinks escaping the workspace are rejected, and uploads to encrypted rooms use
+Matrix encrypted-media metadata.
 
 `!diagnose` snapshots the mapped room state, transient progress, the last 200
 OpenCode event records observed since the bot started (with adjacent token deltas

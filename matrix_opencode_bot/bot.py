@@ -9,6 +9,7 @@ import difflib
 import getpass
 import json
 import logging
+import mimetypes
 import os
 import platform
 import re
@@ -92,6 +93,7 @@ Ordinary messages — prompt the current session, creating one if needed
 !status — show current activity
 !diagnose — write a detailed DIAGNOSIS.txt in the session directory
 !bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
+!send <filename> — find and send a file from the session directory
 !yolo off — disable session-scoped automatic permission approval
 !diff — show changed files
 !stop — stop a pursuit and abort the current operation
@@ -99,7 +101,7 @@ Ordinary messages — prompt the current session, creating one if needed
 !help — show this message"""
 
 SESSION_REMINDER = (
-    "Commands: !new [directory], !pursue <goal>, !status, !diagnose, !bump, !diff, "
+    "Commands: !new [directory], !pursue <goal>, !status, !diagnose, !bump, !send, !diff, "
     "!yolo off, !stop, !reset, !help"
 )
 STARTUP_LOGO_PATH = Path(__file__).with_name("assets") / "openbot-logo.png"
@@ -201,6 +203,8 @@ class MatrixOpenCodeBot:
                 await self.command_yolo_setting(room_id, argument.strip().lower())
             elif command == "!diff":
                 await self.command_diff(room_id)
+            elif command == "!send":
+                await self.command_send(room_id, argument.strip())
             elif command == "!stop":
                 await self.command_stop(room_id)
             elif command == "!reset":
@@ -1417,6 +1421,41 @@ Return exactly:
             return
         await self.send_chunked(room_id, render_diffs(diffs))
 
+    async def command_send(self, room_id: str, query: str) -> None:
+        if not query:
+            await self.send_text(room_id, "Usage: !send <filename>")
+            return
+
+        state = self.store.rooms.get(room_id)
+        root = (
+            Path(state.directory) if state else self.settings.default_directory
+        ).resolve()
+        matches = await find_files(root, query)
+        if not matches:
+            await self.send_text(
+                room_id,
+                f'No file matching "{query}" was found beneath {root}.',
+            )
+            return
+
+        exact = [path for path in matches if path.name.casefold() == query.casefold()]
+        direct = _safe_direct_file(root, query)
+        selected = direct or (exact[0] if len(exact) == 1 else None)
+        if selected is None:
+            lines = [f'Found {len(matches)} possible files. Choose one:']
+            lines.extend(f"!send {path.relative_to(root)}" for path in matches)
+            await self.send_text(room_id, "\n".join(lines))
+            return
+
+        try:
+            selected = selected.resolve(strict=True)
+            if not selected.is_file() or not selected.is_relative_to(root):
+                raise OSError("file is no longer inside the session directory")
+            await self.send_file(room_id, selected)
+        except (OSError, RuntimeError) as exc:
+            LOG.warning("Could not send %s to %s: %s", selected, room_id, exc)
+            await self.send_text(room_id, f"Could not send {selected.name}: {exc}")
+
     async def command_stop(self, room_id: str) -> None:
         state = self.store.rooms.get(room_id)
         if not state:
@@ -2429,6 +2468,48 @@ Return exactly:
         )
         self.last_edit[room_id] = time.monotonic()
 
+    async def send_file(self, room_id: str, path: Path) -> None:
+        """Upload a workspace file as Matrix media, encrypting it for encrypted rooms."""
+
+        room = getattr(self.client, "rooms", {}).get(room_id)
+        encrypted = bool(getattr(room, "encrypted", self.settings.require_encryption))
+        size = path.stat().st_size
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        response, decryption_info = await self.client.upload(
+            lambda _got_429, _got_timeouts: path,
+            content_type=content_type,
+            filename=path.name,
+            encrypt=encrypted,
+            filesize=size,
+        )
+        content_uri = getattr(response, "content_uri", None)
+        if not content_uri:
+            raise RuntimeError(f"Matrix media upload failed: {response}")
+
+        content: dict[str, Any] = {
+            "msgtype": "m.file",
+            "body": path.name,
+            "filename": path.name,
+            "info": {"mimetype": content_type, "size": size},
+        }
+        if encrypted:
+            if not decryption_info:
+                raise RuntimeError("Matrix encrypted media upload returned no decryption info")
+            content["file"] = {**decryption_info, "url": content_uri}
+        else:
+            content["url"] = content_uri
+
+        try:
+            await self.client.room_send(
+                room_id=room_id,
+                message_type="m.room.message",
+                content=content,
+                ignore_unverified_devices=self.settings.ignore_unverified_devices,
+            )
+        except OlmUnverifiedDeviceError as exc:
+            raise RuntimeError("the room has unverified devices") from exc
+        self.last_edit[room_id] = time.monotonic()
+
     async def send_edit(self, room_id: str, event_id: str, body: str) -> None:
         content = {
             "msgtype": "m.text",
@@ -2466,6 +2547,75 @@ Return exactly:
             await asyncio.gather(*self.edit_tasks.values(), return_exceptions=True)
         if self.retry_tasks:
             await asyncio.gather(*self.retry_tasks.values(), return_exceptions=True)
+
+
+def _safe_direct_file(root: Path, query: str) -> Path | None:
+    """Resolve an explicit path while preventing traversal and symlink escapes."""
+
+    candidate = Path(query).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved.is_file() or not resolved.is_relative_to(root.resolve()):
+        return None
+    return resolved
+
+
+async def find_files(root: Path, query: str, limit: int = 10) -> list[Path]:
+    """Return ranked workspace files for a case-insensitive filename/path query."""
+
+    root = root.resolve()
+    query_folded = query.casefold()
+    direct = _safe_direct_file(root, query)
+    ranked: list[tuple[tuple[int, float, int, str], Path]] = []
+
+    files_seen = 0
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        # Repository internals are both noisy and never useful chat attachments.
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        directory_path = Path(directory)
+        for filename in filenames:
+            files_seen += 1
+            if files_seen % 250 == 0:
+                # Keep event processing responsive in unusually large workspaces.
+                await asyncio.sleep(0)
+            path = directory_path / filename
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved.is_file() or not resolved.is_relative_to(root):
+                continue
+
+            relative = path.relative_to(root).as_posix()
+            name_folded = filename.casefold()
+            relative_folded = relative.casefold()
+            similarity = difflib.SequenceMatcher(None, query_folded, name_folded).ratio()
+            if relative_folded == query_folded:
+                tier = 0
+            elif name_folded == query_folded:
+                tier = 1
+            elif name_folded.startswith(query_folded):
+                tier = 2
+            elif query_folded in name_folded:
+                tier = 3
+            elif query_folded in relative_folded:
+                tier = 4
+            elif similarity >= 0.55:
+                tier = 5
+            else:
+                continue
+            ranked.append(((tier, -similarity, len(relative), relative_folded), path))
+
+    ranked.sort(key=lambda item: item[0])
+    results = [path for _, path in ranked[:limit]]
+    if direct and direct not in results:
+        results.insert(0, direct)
+        del results[limit:]
+    return results
 
 
 def split_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
