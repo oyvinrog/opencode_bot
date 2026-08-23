@@ -66,6 +66,11 @@ MAX_REASONING_CHARS = 8_000
 WATCHDOG_POLL_SECONDS = 30.0
 MAX_PURSUIT_DURATION_SECONDS = 8 * 60 * 60
 PURSUIT_FINAL_CHECK_TIMEOUT_SECONDS = 300.0
+# Recorded checker output carried back to the worker.  One checker may capture
+# MAX_CHECK_OUTPUT characters and a contract may hold twelve criteria, so the feedback block
+# is capped as a whole and divided between the criteria that actually failed.
+PURSUIT_FEEDBACK_OUTPUT_BUDGET = 12_000
+PURSUIT_FEEDBACK_OUTPUT_FLOOR = 1_000
 PURSUIT_DURATION_RE = re.compile(r"^([1-9][0-9]*)([mh])$", re.IGNORECASE)
 WATCHDOG_CONTINUATION = (
     "The previous turn was automatically interrupted because it produced no activity for "
@@ -129,6 +134,21 @@ def _pursuit_extent_instruction(extent: int, *, unattended: bool = False) -> str
             PursuitBudget.for_extent(value), unattended=unattended
         )
     )
+
+
+def _condense_check_output(value: str, limit: int) -> str:
+    """Return recorded checker output shortened to ``limit`` characters.
+
+    Both ends are kept because the deciding lines sit at either one depending on the checker:
+    compilers report the first error, test runners summarize after the failure detail.
+    """
+
+    text = (value or "").strip()
+    if len(text) <= limit:
+        return text
+    head = limit // 3
+    tail = limit - head
+    return f"{text[:head]}\n… {len(text) - limit:,} characters elided …\n{text[-tail:]}"
 
 
 def _parse_pursuit_budget_choice(value: str) -> tuple[int, PursuitBudget] | None:
@@ -1064,6 +1084,9 @@ class MatrixOpenCodeBot:
         if reason == "invalid_contract":
             await self._pause_invalid_restored_contract(room_id, state)
             return
+        if reason == "legacy_migration":
+            await self._restart_legacy_pursuit(room_id, state)
+            return
         if reason == "stop":
             session_id = state.pursuit_termination_session_id or self._active_session_id(
                 state
@@ -1458,16 +1481,31 @@ value and omitting unused checker variants:
         if contract is None:
             return "No approved pursuit contract is available. Stop without acting."
         checks = state.current_check_results()
-        feedback = [
-            {
-                "criterion_id": criterion.id,
-                "status": checks[criterion.id].status.value,
-                "summary": checks[criterion.id].summary,
-                "source": checks[criterion.id].source,
-            }
+        unresolved = [
+            criterion
             for criterion in contract.criteria
             if criterion.id in checks and checks[criterion.id].status != CriterionStatus.PASS
         ]
+        # A summary alone only tells the worker that a check failed; it would have to spend its
+        # own tool budget rediscovering why, possibly with a different command than the checker
+        # ran.  The recorded output is what makes the next attempt targeted.
+        per_criterion = max(
+            PURSUIT_FEEDBACK_OUTPUT_FLOOR,
+            PURSUIT_FEEDBACK_OUTPUT_BUDGET // max(1, len(unresolved)),
+        )
+        feedback: list[dict[str, Any]] = []
+        for criterion in unresolved:
+            result = checks[criterion.id]
+            entry: dict[str, Any] = {
+                "criterion_id": criterion.id,
+                "status": result.status.value,
+                "summary": result.summary,
+                "source": result.source,
+            }
+            recorded = _condense_check_output(result.raw_output, per_criterion)
+            if recorded:
+                entry["checker_output"] = recorded
+            feedback.append(entry)
         ledger = state.pursuit_budget_ledger or BudgetLedger(limits=contract.budget)
         usage = ledger.effective_usage()
         criteria = [
@@ -2457,9 +2495,9 @@ Delegated task/subagent calls are disabled."""
         outcome: PursuitOutcome,
         uncertainty: list[str],
     ) -> None:
-        if self.pursuit_stop_events[room_id].is_set():
+        stop_event = self.pursuit_stop_events[room_id]
+        if stop_event.is_set():
             return
-        self.pursuit_stop_events.pop(room_id, None)
         self._cancel_deadline_timer(room_id)
         for retry_room, permission_id in list(self.permission_retry_tasks):
             if retry_room == room_id:
@@ -2473,11 +2511,17 @@ Delegated task/subagent calls are disabled."""
             state.pursuit_budget_ledger.pause()
         state.pursuit_remaining_uncertainty = uncertainty
         report = await self._build_pursuit_report(state, outcome, uncertainty)
+        # `!stop` is signalled before its Matrix handler waits for this room's
+        # lock.  Do not let a stop arriving during report/diff collection race
+        # a success archive into durable state.
+        if stop_event.is_set():
+            return
         state.archive_pursuit(
             outcome, report, artifact_refs=state.pursuit_artifact_refs
         )
         self._clear_pursuit(state, preserve_outcome=True)
         await self.store.save()
+        self.pursuit_stop_events.pop(room_id, None)
         prefix = "✅ " if outcome == PursuitOutcome.VERIFIED_COMPLETE else ""
         await self.send_text(room_id, prefix + report)
 
@@ -3196,7 +3240,9 @@ Delegated task/subagent calls are disabled."""
             if retry_room == room_id:
                 self._cancel_permission_retry(retry_room, permission_id)
         revoked_unattended = state.pursuit_unattended
-        self._revoke_unattended_authorization(state)
+        # Revoke execution, but retain the immutable approved deadline and
+        # cumulative renewal/provenance fields for status and the final audit.
+        self._expire_unattended_authorization(state)
         state.pending_pursuit_unattended = False
         await self.store.save()
         await self.send_text(
@@ -4247,12 +4293,19 @@ Delegated task/subagent calls are disabled."""
                     continue
                 try:
                     self.settings.resolve_directory(state.directory)
+                    if state.pursuit_termination_reason:
+                        await self._resume_pending_termination(room_id, state)
+                        changed = True
+                        if state.pursuit_termination_reason:
+                            continue
                     if (
                         state.pursuit_goal
                         and state.pursuit_protocol_version < PURSUIT_PROTOCOL_VERSION
                     ):
-                        await self._restart_legacy_pursuit(room_id, state)
+                        migrated = await self._restart_legacy_pursuit(room_id, state)
                         changed = True
+                        if not migrated:
+                            continue
                     try:
                         session = await self.opencode.get_session(
                             state.session_id, state.directory
@@ -4356,7 +4409,9 @@ Delegated task/subagent calls are disabled."""
                 and state.pursuit_protocol_version < PURSUIT_PROTOCOL_VERSION
             ):
                 async with self.room_locks[room_id]:
-                    await self._restart_legacy_pursuit(room_id, state)
+                    migrated = await self._restart_legacy_pursuit(room_id, state)
+                    if not migrated:
+                        continue
             if not state.pursuit_goal:
                 for pending in list(state.pending_permissions):
                     if self._permission_auto_approval_is_authorized(state, pending):
@@ -4428,18 +4483,44 @@ Delegated task/subagent calls are disabled."""
                 if (await self._status(state)).get("type") == "idle":
                     await self._resume_pursuit_phase(room_id, state)
 
-    async def _restart_legacy_pursuit(self, room_id: str, state: RoomSession) -> None:
+    async def _restart_legacy_pursuit(
+        self, room_id: str, state: RoomSession
+    ) -> bool:
         goal = state.pursuit_goal
         if not goal:
-            return
+            return True
+        session_id = (
+            state.pursuit_termination_session_id
+            if state.pursuit_termination_reason == "legacy_migration"
+            and state.pursuit_termination_session_id
+            else self._active_session_id(state)
+        )
+        state.pursuit_termination_reason = "legacy_migration"
+        state.pursuit_termination_session_id = session_id
+        await self.store.save()
         if state.in_flight_event_id:
-            with contextlib.suppress(OpenCodeError):
-                await self.opencode.abort(self._active_session_id(state), state.directory)
+            busy = True
+        else:
+            try:
+                busy = (await self._status(state, session_id)).get("type") != "idle"
+            except OpenCodeError:
+                busy = True
+        if busy and not await self._confirm_session_stopped(state, session_id):
+            await self._mark_termination_pending(
+                room_id,
+                state,
+                reason="legacy_migration",
+                session_id=session_id,
+            )
+            return False
+        await self._capture_interrupted_worker_input_tokens(state)
+        if state.in_flight_event_id:
             await self.finalize(
                 room_id,
                 state,
                 "Migrating this pursuit to protocol v3. Previous prose evidence is untrusted.",
             )
+        self._cancel_session_permission_retries(room_id, state, session_id)
         criteria = [
             PursuitCriterion(
                 item["id"], item["text"], VerificationKind.HUMAN
@@ -4479,12 +4560,14 @@ Delegated task/subagent calls are disabled."""
         state.pursuit_protocol_failures = 0
         state.pursuit_retry_attempts = 0
         state.pursuit_last_worker_report = None
+        self._clear_termination_marker(state)
         state.pursuit_check_results.clear()
         state.pursuit_attempts.clear()
         state.pursuit_budget_ledger = BudgetLedger(limits=contract.budget)
         state.pursuit_workspace_fingerprint = await workspace_revision(state.directory)
         await self.store.save()
         await self.send_text(room_id, self._render_contract(contract, state))
+        return True
 
     async def _resume_pursuit_phase(self, room_id: str, state: RoomSession) -> None:
         if state.pursuit_phase == "draft_contract":

@@ -511,6 +511,11 @@ class PursuitArchive:
     budget: BudgetLedger
     legacy_untrusted_evidence: list[dict[str, str]] = field(default_factory=list)
     artifact_refs: list[str] = field(default_factory=list)
+    unattended_authorized: bool = False
+    authorization_event_id: str | None = None
+    authorization_digest: str | None = None
+    deadline_ms: int | None = None
+    automatic_renewals: int = 0
     archived_at_ms: int = field(default_factory=lambda: _now_ms())
 
     def to_dict(self) -> dict[str, Any]:
@@ -523,6 +528,11 @@ class PursuitArchive:
             "budget": asdict(self.budget),
             "legacy_untrusted_evidence": self.legacy_untrusted_evidence,
             "artifact_refs": self.artifact_refs,
+            "unattended_authorized": self.unattended_authorized,
+            "authorization_event_id": self.authorization_event_id,
+            "authorization_digest": self.authorization_digest,
+            "deadline_ms": self.deadline_ms,
+            "automatic_renewals": self.automatic_renewals,
             "archived_at_ms": self.archived_at_ms,
         }
 
@@ -553,6 +563,13 @@ class PursuitArchive:
                 value.get("legacy_untrusted_evidence")
             ),
             artifact_refs=_string_list(value.get("artifact_refs")),
+            unattended_authorized=bool(value.get("unattended_authorized", False)),
+            authorization_event_id=_optional_string(
+                value.get("authorization_event_id")
+            ),
+            authorization_digest=_optional_string(value.get("authorization_digest")),
+            deadline_ms=_optional_int(value.get("deadline_ms")),
+            automatic_renewals=_nonnegative_int(value.get("automatic_renewals")),
             archived_at_ms=_nonnegative_int(value.get("archived_at_ms")) or _now_ms(),
         )
 
@@ -757,6 +774,15 @@ class RoomSession:
                 if item.get("trust") == "legacy_untrusted"
             ],
             artifact_refs=list(artifact_refs or self.pursuit_artifact_refs),
+            unattended_authorized=bool(
+                self.pursuit_authorization_event_id
+                and self.pursuit_authorization_digest
+                and self.pursuit_deadline_ms is not None
+            ),
+            authorization_event_id=self.pursuit_authorization_event_id,
+            authorization_digest=self.pursuit_authorization_digest,
+            deadline_ms=self.pursuit_deadline_ms,
+            automatic_renewals=self.pursuit_auto_renewals,
             archived_at_ms=_now_ms() if archived_at_ms is None else int(archived_at_ms),
         )
         self.pursuit_history.append(archive)
@@ -840,6 +866,11 @@ class RoomSession:
         stored_protocol = int(
             value.get("pursuit_protocol_version")
             or (1 if pursuit_goal else PURSUIT_PROTOCOL_VERSION)
+        )
+        legacy_worker_must_stop = bool(
+            pursuit_goal
+            and stored_protocol < PURSUIT_PROTOCOL_VERSION
+            and value.get("in_flight_event_id")
         )
         legacy_criteria = _criteria(value.get("acceptance_criteria"))
         contract = PursuitContract.from_dict(value.get("pursuit_contract"))
@@ -968,9 +999,13 @@ class RoomSession:
             ),
             pursuit_termination_reason=_optional_string(
                 value.get("pursuit_termination_reason")
-            ),
+            ) or ("legacy_migration" if legacy_worker_must_stop else None),
             pursuit_termination_session_id=_optional_string(
                 value.get("pursuit_termination_session_id")
+            ) or (
+                str(value["session_id"])
+                if legacy_worker_must_stop
+                else None
             ),
             pursuit_contract=contract,
             pursuit_check_results=check_results if stored_protocol >= PURSUIT_PROTOCOL_VERSION else [],
