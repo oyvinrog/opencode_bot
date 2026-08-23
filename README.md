@@ -105,6 +105,15 @@ sudo journalctl -u matrix-opencode-bot.service -f
 sudo systemctl restart matrix-opencode-bot.service
 ```
 
+Stop the bot temporarily, for example before updating the repository, with:
+
+```bash
+./stop.sh
+```
+
+The service remains enabled and will start again at boot. Running `./install.sh`
+after an update also starts it again.
+
 Remove the background service with:
 
 ```bash
