@@ -3,7 +3,10 @@
 `!pursue` exists to make a tool-using agent more likely to finish a real task,
 not merely to produce a longer answer. It is a bounded controller around one
 worker: make an attempt, check the resulting world, give failures back to the
-worker, and stop or ask the operator when continued work is no longer justified.
+worker, and stop or ask the operator when continued work is no longer authorized.
+In unattended YOLO mode, one contract approval authorizes that loop until early
+verified completion, a genuine external blocker, an explicit stop, or a fixed
+deadline; internal accounting limits do not become interruptions.
 
 The design rests on three principles. They are deliberately narrower than the
 claims made by the earlier design.
@@ -85,16 +88,27 @@ again.
 Approval is a product control, not an empirical claim that LLM-generated
 contracts are optimal. It prevents the controller from silently changing the
 goal, accepting unsafe authority, or choosing a weak proxy without showing the
-operator. The user's original request remains authoritative over the draft.
+operator. The user's original request remains authoritative over the draft. If
+the draft selects unattended YOLO, approval also creates a pursuit-scoped lease
+bound to that contract's digest. A session-wide permission setting cannot
+authorize a new or revised contract.
 
-The lifecycle is:
+The interactive lifecycle is:
 
 > draft contract → await approval → work → check → repair, finish, or pause
 
-An objectively checked pursuit can reach `verified_complete`. A pursuit with
-unresolved human criteria reaches `awaiting_signoff`, with its result explicitly
-marked provisional. Missing facts or authority produce `needs_input`; exhausted
-resources produce `budget_checkpoint`; an operator may also choose `stopped`.
+With unattended YOLO, the approved lease starts an absolute deadline when the
+worker launches:
+
+> draft contract → await approval → work ↔ check/repair/rotate → verified result, true blocker, stop, or deadline
+
+An objectively checked pursuit can reach `verified_complete` as soon as the
+latest checks pass. An interactive pursuit with unresolved human criteria reaches
+`awaiting_signoff`, with its result explicitly marked provisional; an unattended
+pursuit instead finishes provisionally without claiming human approval. Missing
+facts or authority produce `needs_input`, and an operator may always choose
+`stopped`. `budget_checkpoint` remains an interactive state, not a routine pause
+inside a valid unattended lease.
 
 ## 2. Complexity Must Earn Its Keep
 
@@ -125,24 +139,47 @@ benchmarks; none is accepted here as a universal law. Each may be promoted only
 after a matched OpenBot experiment shows a reproducible benefit for the task
 class where it will run.
 
-### Finite, Visible Budgets
+### Finite, Visible Budgets and Leases
 
 Persistence is bounded. The initial budget is shown before approval:
 
-| Extent | Worker/check cycles | Tool calls | Input tokens | Wall time |
+| Input / extent | Worker/check cycles | Tool calls | Input tokens | Wall time |
 | --- | ---: | ---: | ---: | ---: |
-| Focused | 4 | 40 | 250,000 | 60 minutes |
-| Thorough | 12 | 120 | 750,000 | 180 minutes |
-| Extended | 32 | 320 | 2,000,000 | 480 minutes |
+| `1` — Focused | 4 | 40 | 250,000 | 60 minutes |
+| `2` — Thorough | 12 | 120 | 750,000 | 180 minutes |
+| `3` — Extended | 32 | 320 | 2,000,000 | 480 minutes |
 
-These numbers are OpenBot policy defaults. No cited experiment establishes them
-as optimal. They provide predictable operator control and measurable starting
-points for later tuning.
+The operator may instead enter a positive whole-minute or whole-hour duration,
+such as `90m` or `4h`, up to eight hours. Its cycle, tool-call, and input-token
+allowances scale at the hourly rates above. These numbers are OpenBot policy
+defaults. No cited experiment establishes them as optimal. They provide
+predictable operator control and measurable starting points for later tuning.
 
-Reaching any limit creates a `budget_checkpoint`; it does not turn incomplete
-work into success. The operator may grant another visible tranche, revise and
-reapprove the contract, or stop. There is no promise to try every plausible
-avenue, and consuming more compute is never evidence by itself.
+In interactive mode, reaching any limit creates a `budget_checkpoint`; it does
+not turn incomplete work into success. The operator may grant another visible
+tranche, revise and reapprove the contract, or stop.
+
+In unattended YOLO mode, wall time is the maximum lease duration and the absolute
+deadline never moves. Reaching a cycle, tool-call, or input-token allowance
+rotates to a fresh worker and renews that internal tranche automatically without
+a reply, while cumulative usage and the original deadline remain visible. Bot
+downtime counts against the lease. The controller resumes after restart only if
+time remains.
+
+At the deadline, worker actions stop and one bounded, read-only final check
+records either the verified outcome or a terminal `deadline_reached` report. If
+only human checks remain, the terminal result is clearly provisional; the
+controller never fabricates sign-off. Before the deadline, only a true external
+blocker—missing credentials or authority, a material user-only fact, an
+unavailable required verifier, or an explicit non-retryable permission
+refusal—may pause unattended work. Transient permission failures are retried.
+`!yolo off` revokes the lease, and `!stop` remains immediate. A material contract
+revision always requires new approval and starts a new deadline.
+
+Automatic rotations and progress messages may be reported to the room, but they
+are notices rather than prompts. A message that actually requires approval,
+input, or a permission decision says so explicitly. There is no promise to try
+every plausible avenue, and consuming more compute is never evidence by itself.
 
 ## 3. Reliability Is a Distribution
 

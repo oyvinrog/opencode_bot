@@ -16,6 +16,10 @@ from typing import Any
 _CONTROL = re.compile(
     r"<pursuit-control>\s*(\{.*?\})\s*</pursuit-control>", re.DOTALL
 )
+_BLOCKER = re.compile(
+    r"\s*<pursuit-blocker>\s*(\{.*?\})\s*</pursuit-blocker>\s*",
+    re.DOTALL,
+)
 _PLACEHOLDER = re.compile(
     r"(?:<[^>]+>|\b(?:todo|tbd|placeholder|criterion text|insert here)\b)",
     re.IGNORECASE,
@@ -50,6 +54,34 @@ _PATH_STATE_PREDICATES = {
     "json_equals",
 }
 _URL_STATE_PREDICATES = {"status", "contains", "json_equals"}
+_BLOCKER_REASONS = {
+    "missing_credentials",
+    "missing_authority",
+    "material_user_fact",
+    "verifier_unavailable",
+    "permission_refused",
+}
+
+
+def parse_worker_blocker(text: str) -> dict[str, str] | None:
+    """Accept only a narrow, exact worker request for genuinely external input."""
+
+    matched = _BLOCKER.fullmatch(text)
+    if not matched:
+        return None
+    try:
+        value = json.loads(matched.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict) or set(value) != {"reason", "question"}:
+        return None
+    reason = value.get("reason")
+    question = value.get("question")
+    if reason not in _BLOCKER_REASONS:
+        return None
+    if not isinstance(question, str) or not _valid_text(question, maximum=2_000):
+        return None
+    return {"reason": str(reason), "question": question.strip()}
 
 
 def parse_contract_control(text: str) -> dict[str, Any] | None:

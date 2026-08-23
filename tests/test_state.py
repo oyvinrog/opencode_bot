@@ -1,6 +1,7 @@
 import json
 import hashlib
 import stat
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -38,11 +39,17 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
             pending_pursuit_goal="Await a depth choice",
             pending_pursuit_reuse_session=True,
             pending_pursuit_yolo_confirmation=True,
+            pending_pursuit_unattended=True,
             pursuit_goal="Investigate thoroughly",
             pursuit_extent=3,
             pursuit_phase="verifying",
             pursuit_iteration=7,
             pursuit_worker_input_tokens=42_000,
+            pursuit_unattended=True,
+            pursuit_authorization_event_id="$approval",
+            pursuit_authorization_digest="a" * 64,
+            pursuit_deadline_ms=14_400_123,
+            pursuit_auto_renewals=3,
             verifier_session_id="ses_verify",
             acceptance_criteria=[{"id": "c1", "text": "Answer is source-grounded"}],
             pursuit_criteria_status={"c1": "unknown"},
@@ -73,11 +80,17 @@ async def test_state_round_trip_and_owner_only_mode(tmp_path: Path) -> None:
     assert restored.rooms["!room:example"].pending_pursuit_goal == "Await a depth choice"
     assert restored.rooms["!room:example"].pending_pursuit_reuse_session is True
     assert restored.rooms["!room:example"].pending_pursuit_yolo_confirmation is True
+    assert restored.rooms["!room:example"].pending_pursuit_unattended is True
     assert restored.rooms["!room:example"].pursuit_extent == 3
     assert restored.rooms["!room:example"].pursuit_iteration == 7
     assert restored.rooms["!room:example"].verifier_session_id == "ses_verify"
     assert restored.rooms["!room:example"].pursuit_evidence[0]["claim"] == "Primary record found"
     assert restored.rooms["!room:example"].pursuit_worker_input_tokens == 42_000
+    assert restored.rooms["!room:example"].pursuit_unattended is True
+    assert restored.rooms["!room:example"].pursuit_authorization_event_id == "$approval"
+    assert restored.rooms["!room:example"].pursuit_authorization_digest == "a" * 64
+    assert restored.rooms["!room:example"].pursuit_deadline_ms == 14_400_123
+    assert restored.rooms["!room:example"].pursuit_auto_renewals == 3
     assert json.loads(path.read_text())["version"] == 3
     assert restored.rooms["!room:example"].bump_confirmation_session_id == "ses_1"
     assert restored.rooms["!room:example"].manual_bump_pending is True
@@ -129,6 +142,24 @@ def test_existing_pending_pursuit_defaults_to_extent_stage(tmp_path: Path) -> No
     assert state.pending_pursuit_yolo_confirmation is False
 
 
+def test_legacy_yolo_does_not_authorize_unattended_pursuit(tmp_path: Path) -> None:
+    state = RoomSession.from_dict({
+        "session_id": "ses",
+        "directory": str(tmp_path),
+        "yolo_permissions": True,
+        "pending_pursuit_goal": "Awaiting extent",
+        "pursuit_goal": "An old pursuit",
+    })
+
+    assert state.yolo_permissions is True
+    assert state.pending_pursuit_unattended is False
+    assert state.pursuit_unattended is False
+    assert state.pursuit_authorization_event_id is None
+    assert state.pursuit_authorization_digest is None
+    assert state.pursuit_deadline_ms is None
+    assert state.pursuit_auto_renewals == 0
+
+
 async def test_remove_persists_empty_mapping(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     store = StateStore(path)
@@ -165,6 +196,64 @@ def test_extent_budgets_and_boundaries() -> None:
     assert ledger.total_usage.cycles == 4
     assert ledger.total_usage.elapsed_seconds == 3_600
     assert ledger.exhausted_limits(now_ms=3_601_000) == []
+
+
+def test_duration_budgets_scale_at_hourly_rates_and_round_up() -> None:
+    assert PursuitBudget.for_duration(4 * 60 * 60) == PursuitBudget(
+        16, 160, 1_000_000, 14_400
+    )
+    assert PursuitBudget.for_duration(90 * 60) == PursuitBudget(
+        6, 60, 375_000, 5_400
+    )
+    assert PursuitBudget.for_duration(1) == PursuitBudget(1, 1, 70, 1)
+
+
+@pytest.mark.parametrize("seconds", [0, -1, 8 * 60 * 60 + 1, "invalid", None])
+def test_duration_budget_rejects_invalid_or_out_of_range_values(seconds: object) -> None:
+    with pytest.raises(ValueError):
+        PursuitBudget.for_duration(seconds)  # type: ignore[arg-type]
+
+
+def test_duration_budget_accepts_eight_hour_boundary() -> None:
+    assert PursuitBudget.for_duration(8 * 60 * 60) == PursuitBudget.for_extent(3)
+
+
+def test_restored_contract_budget_overrides_missing_or_mismatched_ledger(
+    tmp_path: Path,
+) -> None:
+    budget = PursuitBudget.for_duration(4 * 60 * 60)
+    contract = PursuitContract.draft(
+        "Run for at most four hours",
+        [PursuitCriterion("c1", "The artifact exists", VerificationKind.HUMAN)],
+        budget=budget,
+    )
+    contract.approve("$approval", 1_000)
+    mismatched = BudgetLedger(limits=PursuitBudget.for_extent(1))
+    mismatched.record_cycle(2)
+
+    for stored_ledger, expected_cycles in (
+        (None, 0),
+        (asdict(mismatched), 2),
+    ):
+        raw = {
+            "session_id": "ses-worker",
+            "directory": str(tmp_path),
+            "pursuit_goal": contract.goal,
+            "pursuit_phase": "working",
+            "pursuit_extent": 1,
+            "pursuit_protocol_version": 3,
+            "pursuit_contract": contract.to_dict(),
+        }
+        if stored_ledger is not None:
+            raw["pursuit_budget_ledger"] = stored_ledger
+
+        restored = RoomSession.from_dict(raw)
+
+        assert restored.pursuit_contract is not None
+        assert restored.pursuit_contract.budget == budget
+        assert restored.pursuit_budget_ledger is not None
+        assert restored.pursuit_budget_ledger.limits == budget
+        assert restored.pursuit_budget_ledger.usage.cycles == expected_cycles
 
 
 def test_contract_approval_is_versioned_and_content_bound() -> None:

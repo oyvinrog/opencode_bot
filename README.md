@@ -136,13 +136,13 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!help` — show the command list
 - `!new [directory]` — create a new session, using the default directory when omitted
 - Ordinary messages — prompt the current session, creating one in the default directory if needed
-- `!pursue <goal>` — approve a bounded, checkable contract, then work until it is verified or pauses
-- `!status` — show the session, directory, activity, permissions, and change totals
+- `!pursue <goal>` — approve a bounded, checkable contract, then work until it is verified, blocked, or out of time
+- `!status` — show the session, directory, activity, permissions, pursuit lease, resource usage, and change totals
 - `!diagnose` — write `DIAGNOSIS.txt` in the mapped session directory
 - `!bump` — report inactivity and ask before restarting the same stalled turn
 - `!bump confirm` / `!bump cancel` — approve or cancel the proposed restart
 - `!send <filename>` — find and send a file from the mapped session directory
-- `!yolo off` — disable session-scoped automatic permission approval
+- `!yolo off` — disable automatic permission approval and revoke the active pursuit's unattended lease
 - `!diff` — show unified diffs for the session
 - `!stop` — abort the current operation
 - `!reset` — discard only the room mapping
@@ -172,23 +172,30 @@ redacted, but arbitrary prompts, model/tool output, paths, and source diffs can
 still contain private data. Inspect `DIAGNOSIS.txt` before copying or sharing it.
 
 Starting a session posts a compact reminder of the available commands. `!pursue`
-first asks whether to enable session-scoped YOLO mode, accepting `y` or `n`. A `y`
-automatically approves future permission requests for the mapped session and its
-pursuit worker; `n` disables YOLO even if it was previously enabled. It then asks
-for an extent with a visible initial budget:
+first asks whether this pursuit should use unattended YOLO mode, accepting `y` or
+`n`, and then asks for an extent or exact duration with a visible budget. Choosing
+`y` is only part of the draft: unattended authority begins when the user approves
+that exact contract. An older session-wide YOLO setting never authorizes a new or
+revised pursuit contract.
 
-| Extent | Worker/check cycles | Tool calls | Input tokens | Wall time |
+| Input / extent | Worker/check cycles | Tool calls | Input tokens | Wall time |
 | --- | ---: | ---: | ---: | ---: |
 | `1` — Focused | 4 | 40 | 250,000 | 60 minutes |
 | `2` — Thorough | 12 | 120 | 750,000 | 180 minutes |
 | `3` — Extended | 32 | 320 | 2,000,000 | 480 minutes |
 
-These are finite product defaults, not claims that those values are optimal.
-After the extent choice, the bot drafts a versioned contract containing the goal,
+The duration may instead be a positive whole number of minutes or hours, such as
+`90m` or `4h`, up to the same eight-hour maximum. Custom-duration cycle,
+tool-call, and input-token quotas scale at the rates shown in the table. These are
+finite product defaults, not claims that those values are optimal.
+After the budget choice, the bot drafts a versioned contract containing the goal,
 constraints, assumptions, acceptance criteria, a verification method for every
 criterion, and the selected budget. Review the draft and reply `approve` to start
 or `revise <changes>` to request a new version. Material changes always require a
-fresh approval. `stop` or `!stop` ends the pursuit.
+fresh approval. For unattended YOLO, approval binds the lease to the approved
+contract digest and starts one absolute deadline when its worker launches. A
+material revision invalidates that lease; approving the new contract starts a new
+one. `stop` or `!stop` ends the pursuit immediately.
 
 An approved pursuit starts one fresh worker, preventing a large or poisoned
 ordinary-chat transcript from contaminating the work. Worker output is relayed as
@@ -200,27 +207,50 @@ attempt, and observed workspace or state revision; later mutations make affected
 results stale and force a fresh check. Failed, unknown, duplicate, stale, or
 model-authored evidence cannot complete a criterion.
 
-Failed checks are returned to the same worker for a bounded repair cycle. There
-is no separate LLM verifier and no free-form reflection loop. The pursuit reaches
+Failed checks are returned to the worker for a bounded repair cycle. There is no
+separate LLM verifier and no free-form reflection loop. The pursuit reaches
 `verified_complete` only when every objective criterion passes against the latest
-result. If human criteria remain, it pauses at `awaiting_signoff` and labels the
-result provisional; `approve` signs off on that exact contract and result. A
-missing fact or authorization pauses at `needs_input` for an ordinary reply.
+result, and it may finish before its maximum duration.
 
-Reaching any cycle, tool-call, input-token, or wall-time limit pauses at
-`budget_checkpoint`; it never converts incomplete work into success. Reply
-`continue` to grant another visible tranche, `revise <changes>` to create and
-review a new contract version, or `stop` to finish without verification. A
-revised contract still requires `approve`. The final report contains the usable
-result, assumptions, per-criterion checks, remaining uncertainty, resource usage,
-and artifact references.
+Without unattended YOLO, pursuits remain interactive. Unresolved human criteria
+pause at `awaiting_signoff`, missing facts or authorization pause at
+`needs_input`, and an exhausted cycle, tool-call, input-token, or wall-time tranche
+pauses at `budget_checkpoint`. The user can reply `continue`, revise and approve a
+new contract, sign off on the exact provisional result, or stop as appropriate.
 
-Pursuits and their budget ledgers survive bot restarts. Pursuit workers use
-direct, observable tools; delegated `task` calls are disabled. `!stop` aborts an
-active worker or check and records a stopped outcome. When upgrading a persisted
-protocol-v2 pursuit, the bot retains its goal and draft criteria, returns to
-contract approval, marks earlier prose evidence `legacy_untrusted`, and requires
-fresh controller checks. Old OpenCode sessions remain available for audit.
+With an unattended YOLO lease, cycle, tool-call, and input-token quotas are
+internal rotation boundaries. The controller starts a fresh worker and renews the
+tranche automatically, preserving the fixed absolute deadline and cumulative
+usage; no Matrix reply is needed. It retries transient permission failures and
+pauses only for a genuine external blocker: missing credentials or authority, a
+material fact only the user can supply, an unavailable required verifier, or an
+explicit non-retryable permission refusal. If a blocker leads to a material
+contract revision, continuation requires approval of the new contract and a new
+lease.
+
+At the absolute deadline, worker actions stop and the controller performs one
+bounded, read-only final check. It then archives a terminal `verified_complete`
+or `deadline_reached` report instead of waiting at `budget_checkpoint`. If only
+human-judgment criteria remain, an unattended pursuit finishes with a clearly
+marked provisional result; it never invents human sign-off. Every final report
+contains the usable result, assumptions, per-criterion checks, remaining
+uncertainty, cumulative resource usage, and artifact references.
+
+Pursuits, approved unattended leases, absolute deadlines, and cumulative budget
+ledgers survive bot restarts. Downtime counts against the deadline: an authorized
+pursuit resumes while time remains, while an expired pursuit proceeds directly to
+its bounded final check and terminal report. Approval and input states remain
+waiting after restart, and unattended human-signoff states become provisional
+completion rather than false approval. `!status` shows whether unattended mode is
+active, the fixed deadline and remaining time, automatic renewal count, and
+cumulative resource usage.
+
+Pursuit workers use direct, observable tools; delegated `task` calls are disabled.
+`!stop` aborts an active worker or check and records a stopped outcome. When
+upgrading a persisted protocol-v2 pursuit, the bot retains its goal and draft
+criteria, returns to contract approval, marks earlier prose evidence
+`legacy_untrusted`, and requires fresh controller checks. Old OpenCode sessions
+remain available for audit.
 
 Verification adapts conservatively to the task. Tests and builds can objectively
 check specified software behavior, and read-only API queries can check specified
@@ -238,8 +268,10 @@ permission prompt, or initial progress message. While busy, the progress message
 current plan item, plan completion, recent phases, tool names and status, retries,
 subagents, and file-update counts. Raw hidden reasoning, tool arguments, and
 commands are not posted; user-visible plan descriptions may mention files.
-Permission requests and errors are sent immediately. Replies longer than 20,000
-characters are split at completion.
+Progress and automatic-renewal notices are informational and never require a
+reply. Actual approval, input, or permission prompts are sent as distinct messages
+with an explicit reply instruction. Permission errors are sent immediately.
+Replies longer than 20,000 characters are split at completion.
 
 Both the current OpenCode `permission.asked` event schema and the legacy
 `permission.updated` schema are normalized. This is especially important for
@@ -249,10 +281,14 @@ an indefinitely running tool. These replies are interpreted as permission answer
 only while the room has a pending request. During `!pursue` setup, `y` and `n`
 instead answer the explicit YOLO question; outside those two states they remain
 ordinary messages.
-`YOLO` approves all currently pending requests and automatically answers future
-requests for the mapped session, including its pursuit worker.
-It survives bot restarts, but `!new` and `!reset` clear it; `!yolo off` disables it.
-Automatic approvals do not override permissions OpenCode explicitly denies.
+`YOLO` on a pending permission request approves all currently pending requests and
+automatically answers future requests for the mapped session, including its
+pursuit worker. That session setting survives bot restarts, but it does not create
+or extend an unattended pursuit lease; only approval of a draft that explicitly
+selected unattended YOLO can do that. `!new` and `!reset` clear the session
+setting. `!yolo off` disables it and revokes an active pursuit lease, after which
+continuation follows the interactive rules. Automatic approvals never override a
+permission OpenCode explicitly denies.
 
 An in-process watchdog checks active bot-submitted prompts every 30 seconds.
 Ordinary turns use `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default).
@@ -264,13 +300,12 @@ a fresh worker session with the interrupted action recorded in the action trace.
 Each repeated recovery requires another full timeout, and `!stop` cancels automatic
 continuation. If OpenCode initially rejects the abort, the watchdog retries on its
 next 30-second check rather than waiting through another timeout. Pending permission
-requests are never interrupted. `!status` shows
-the active deadline as a countdown. The watchdog also
+requests are never interrupted. The watchdog also
 reconciles missed idle events and OpenCode's occasional stale `busy` status by
 requiring a completed timestamp on the latest assistant message before treating a
 busy response as finished.
 
-When a watchdog deadline is reached, the bot sends a new Matrix room message—not
+When a watchdog recovery deadline is reached, the bot sends a new Matrix room message—not
 only a replacement edit—so clients can generate a notification for the recovery.
 External-directory and other permission requests likewise arrive as new messages
 with explicit `y` / `n` / `YOLO` instructions.

@@ -40,6 +40,7 @@ class PursuitOutcome(str, Enum):
     AWAITING_SIGNOFF = "awaiting_signoff"
     NEEDS_INPUT = "needs_input"
     BUDGET_CHECKPOINT = "budget_checkpoint"
+    DEADLINE_REACHED = "deadline_reached"
     STOPPED = "stopped"
 
 
@@ -49,6 +50,27 @@ class PursuitBudget:
     max_tool_calls: int = 40
     max_input_tokens: int = 250_000
     max_elapsed_seconds: int = 3_600
+
+    @classmethod
+    def for_duration(cls, seconds: int) -> "PursuitBudget":
+        try:
+            duration = int(seconds)
+        except (TypeError, ValueError) as error:
+            raise ValueError("pursuit duration must be a positive integer") from error
+        if duration <= 0:
+            raise ValueError("pursuit duration must be positive")
+        if duration > 8 * 60 * 60:
+            raise ValueError("pursuit duration cannot exceed 8 hours")
+
+        def scaled(hourly_rate: int) -> int:
+            return (hourly_rate * duration + 60 * 60 - 1) // (60 * 60)
+
+        return cls(
+            max_cycles=scaled(4),
+            max_tool_calls=scaled(40),
+            max_input_tokens=scaled(250_000),
+            max_elapsed_seconds=duration,
+        )
 
     @classmethod
     def for_extent(cls, extent: int) -> "PursuitBudget":
@@ -63,6 +85,12 @@ class PursuitBudget:
         if not isinstance(value, dict):
             return cls.for_extent(extent)
         defaults = cls.for_extent(extent)
+        elapsed = min(
+            8 * 60 * 60,
+            _positive_int(
+                value.get("max_elapsed_seconds"), defaults.max_elapsed_seconds
+            ),
+        )
         return cls(
             max_cycles=_positive_int(value.get("max_cycles"), defaults.max_cycles),
             max_tool_calls=_positive_int(
@@ -71,9 +99,7 @@ class PursuitBudget:
             max_input_tokens=_positive_int(
                 value.get("max_input_tokens"), defaults.max_input_tokens
             ),
-            max_elapsed_seconds=_positive_int(
-                value.get("max_elapsed_seconds"), defaults.max_elapsed_seconds
-            ),
+            max_elapsed_seconds=elapsed,
         )
 
 
@@ -539,6 +565,7 @@ class PendingPermission:
     pattern: str = ""
     created: int = 0
     session_id: str = ""
+    retry_eligible: bool = True
 
 
 @dataclass
@@ -550,9 +577,12 @@ class RoomSession:
     prompt_started_ms: int | None = None
     pending_permissions: list[PendingPermission] = field(default_factory=list)
     yolo_permissions: bool = False
+    yolo_session_id: str | None = None
+    yolo_contract_digest: str | None = None
     pending_pursuit_goal: str | None = None
     pending_pursuit_reuse_session: bool = False
     pending_pursuit_yolo_confirmation: bool = False
+    pending_pursuit_unattended: bool = False
     pursuit_goal: str | None = None
     pursuit_extent: int = 1
     pursuit_phase: str | None = None
@@ -568,6 +598,13 @@ class RoomSession:
     pursuit_protocol_failures: int = 0
     pursuit_retry_attempts: int = 0
     pursuit_last_worker_report: str | None = None
+    pursuit_unattended: bool = False
+    pursuit_authorization_event_id: str | None = None
+    pursuit_authorization_digest: str | None = None
+    pursuit_deadline_ms: int | None = None
+    pursuit_auto_renewals: int = 0
+    pursuit_termination_reason: str | None = None
+    pursuit_termination_session_id: str | None = None
 
     # Protocol-v3 records. Models never write these fields directly.
     pursuit_contract: PursuitContract | None = None
@@ -701,7 +738,11 @@ class RoomSession:
     ) -> PursuitArchive:
         parsed_outcome = _enum(PursuitOutcome, outcome, PursuitOutcome.STOPPED)
         ledger = self.pursuit_budget_ledger or BudgetLedger(
-            limits=PursuitBudget.for_extent(self.pursuit_extent)
+            limits=(
+                self.pursuit_contract.budget
+                if self.pursuit_contract
+                else PursuitBudget.for_extent(self.pursuit_extent)
+            )
         )
         archive = PursuitArchive(
             contract=self.pursuit_contract,
@@ -733,9 +774,12 @@ class RoomSession:
             "prompt_started_ms": self.prompt_started_ms,
             "pending_permissions": [asdict(value) for value in self.pending_permissions],
             "yolo_permissions": self.yolo_permissions,
+            "yolo_session_id": self.yolo_session_id,
+            "yolo_contract_digest": self.yolo_contract_digest,
             "pending_pursuit_goal": self.pending_pursuit_goal,
             "pending_pursuit_reuse_session": self.pending_pursuit_reuse_session,
             "pending_pursuit_yolo_confirmation": self.pending_pursuit_yolo_confirmation,
+            "pending_pursuit_unattended": self.pending_pursuit_unattended,
             "pursuit_goal": self.pursuit_goal,
             "pursuit_extent": self.pursuit_extent,
             "pursuit_phase": self.pursuit_phase,
@@ -751,6 +795,13 @@ class RoomSession:
             "pursuit_protocol_failures": self.pursuit_protocol_failures,
             "pursuit_retry_attempts": self.pursuit_retry_attempts,
             "pursuit_last_worker_report": self.pursuit_last_worker_report,
+            "pursuit_unattended": self.pursuit_unattended,
+            "pursuit_authorization_event_id": self.pursuit_authorization_event_id,
+            "pursuit_authorization_digest": self.pursuit_authorization_digest,
+            "pursuit_deadline_ms": self.pursuit_deadline_ms,
+            "pursuit_auto_renewals": self.pursuit_auto_renewals,
+            "pursuit_termination_reason": self.pursuit_termination_reason,
+            "pursuit_termination_session_id": self.pursuit_termination_session_id,
             "pursuit_contract": self.pursuit_contract.to_dict() if self.pursuit_contract else None,
             "pursuit_check_results": [item.to_dict() for item in self.pursuit_check_results],
             "pursuit_attempts": [asdict(item) for item in self.pursuit_attempts],
@@ -859,6 +910,20 @@ class RoomSession:
             if (parsed := PursuitArchive.from_dict(item)) is not None
         ] if isinstance(value.get("pursuit_history"), list) else []
 
+        ledger = (
+            BudgetLedger.from_dict(
+                value.get("pursuit_budget_ledger"), extent=extent
+            )
+            if pursuit_goal or value.get("pursuit_budget_ledger")
+            else None
+        )
+        # The approved contract is digest-bound and therefore owns the selected
+        # budget.  Legacy extent remains metadata only.  Keep all accumulated
+        # accounting while repairing a missing or stale ledger limit object.
+        if pursuit_goal and contract is not None:
+            ledger = ledger or BudgetLedger(limits=contract.budget)
+            ledger.limits = contract.budget
+
         return cls(
             session_id=str(value["session_id"]),
             directory=str(value["directory"]),
@@ -867,9 +932,14 @@ class RoomSession:
             prompt_started_ms=_optional_int(value.get("prompt_started_ms")),
             pending_permissions=permissions,
             yolo_permissions=bool(value.get("yolo_permissions", False)),
+            yolo_session_id=_optional_string(value.get("yolo_session_id")),
+            yolo_contract_digest=_optional_string(
+                value.get("yolo_contract_digest")
+            ),
             pending_pursuit_goal=_optional_string(value.get("pending_pursuit_goal")),
             pending_pursuit_reuse_session=bool(value.get("pending_pursuit_reuse_session", False)),
             pending_pursuit_yolo_confirmation=bool(value.get("pending_pursuit_yolo_confirmation", False)),
+            pending_pursuit_unattended=bool(value.get("pending_pursuit_unattended", False)),
             pursuit_goal=str(pursuit_goal) if pursuit_goal else None,
             pursuit_extent=extent,
             pursuit_phase=phase,
@@ -885,12 +955,27 @@ class RoomSession:
             pursuit_protocol_failures=_nonnegative_int(value.get("pursuit_protocol_failures")),
             pursuit_retry_attempts=_nonnegative_int(value.get("pursuit_retry_attempts")),
             pursuit_last_worker_report=_optional_string(value.get("pursuit_last_worker_report")),
+            pursuit_unattended=bool(value.get("pursuit_unattended", False)),
+            pursuit_authorization_event_id=_optional_string(
+                value.get("pursuit_authorization_event_id")
+            ),
+            pursuit_authorization_digest=_optional_string(
+                value.get("pursuit_authorization_digest")
+            ),
+            pursuit_deadline_ms=_optional_int(value.get("pursuit_deadline_ms")),
+            pursuit_auto_renewals=_nonnegative_int(
+                value.get("pursuit_auto_renewals")
+            ),
+            pursuit_termination_reason=_optional_string(
+                value.get("pursuit_termination_reason")
+            ),
+            pursuit_termination_session_id=_optional_string(
+                value.get("pursuit_termination_session_id")
+            ),
             pursuit_contract=contract,
             pursuit_check_results=check_results if stored_protocol >= PURSUIT_PROTOCOL_VERSION else [],
             pursuit_attempts=attempts,
-            pursuit_budget_ledger=BudgetLedger.from_dict(
-                value.get("pursuit_budget_ledger"), extent=extent
-            ) if pursuit_goal or value.get("pursuit_budget_ledger") else None,
+            pursuit_budget_ledger=ledger,
             pursuit_workspace_revision=_nonnegative_int(value.get("pursuit_workspace_revision")),
             pursuit_workspace_fingerprint=_optional_string(
                 value.get("pursuit_workspace_fingerprint")
