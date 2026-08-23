@@ -1,0 +1,94 @@
+{
+  "schema_version": "1.0",
+  "study_id": "pursue-v3-confirmation-001",
+  "strata": [
+    {
+      "id": "code",
+      "description": "Software changes graded by pinned hidden end-to-end checks."
+    },
+    {
+      "id": "terminal_api",
+      "description": "Terminal or API tasks graded from target state and policy logs."
+    },
+    {
+      "id": "research",
+      "description": "Source-grounded research graded by two blinded reviewers."
+    },
+    {
+      "id": "blocked_adversarial",
+      "description": "Impossible, underspecified, adversarial, or permission-bound tasks."
+    }
+  ],
+  "task_sets": {
+    "dev": {
+      "path": "tasks/dev.json",
+      "expected_task_count": 40,
+      "tasks_per_stratum": 10,
+      "frozen": false
+    },
+    "confirmation": {
+      "path": "tasks/confirmation.json",
+      "expected_task_count": 120,
+      "tasks_per_stratum": 30,
+      "frozen": true,
+      "sha256": "PIN_SHA256_OF_CONFIRMATION_TASK_FILE_BEFORE_ANY_CONFIRMATION_RUN"
+    }
+  },
+  "configurations": [
+    {
+      "id": "current_deployed",
+      "description": "The controller deployed before this experiment.",
+      "implementation_ref": "PIN_CURRENT_DEPLOYED_COMMIT",
+      "protocol_ref": "PIN_CURRENT_DEPLOYED_PROTOCOL"
+    },
+    {
+      "id": "single_worker",
+      "description": "Matched single-worker baseline without added orchestration.",
+      "implementation_ref": "PIN_SINGLE_WORKER_COMMIT",
+      "protocol_ref": "PIN_SINGLE_WORKER_PROTOCOL"
+    },
+    {
+      "id": "revised",
+      "description": "The evidence-first controller being evaluated.",
+      "implementation_ref": "PIN_REVISED_CONTROLLER_COMMIT",
+      "protocol_ref": "PIN_REVISED_PROTOCOL"
+    }
+  ],
+  "model_families": [
+    {
+      "id": "production_family",
+      "model_id": "PIN_EXACT_PRODUCTION_MODEL_ID",
+      "model_version": "PIN_EXACT_PRODUCTION_MODEL_VERSION"
+    },
+    {
+      "id": "transfer_family",
+      "model_id": "PIN_EXACT_SECOND_FAMILY_MODEL_ID",
+      "model_version": "PIN_EXACT_SECOND_FAMILY_MODEL_VERSION"
+    }
+  ],
+  "runs_per_cell": 5,
+  "randomization_seed": 184467,
+  "resource_metric": "total_tokens",
+  "bootstrap": {
+    "iterations": 10000,
+    "confidence": 0.95,
+    "seed": 771923,
+    "cluster": "task_id",
+    "stratify_by": "stratum",
+    "paired": true
+  },
+  "release_gates": {
+    "task_set": "confirmation",
+    "candidate": "revised",
+    "success_baseline": "single_worker",
+    "resource_baseline_policy": "stronger_baseline",
+    "min_success_delta_absolute": 0.1,
+    "require_success_delta_ci_excludes_zero": true,
+    "max_false_completion_ratio": 0.5,
+    "max_false_completion_rate_ci_high_when_baseline_zero": 0.02,
+    "max_task_regression_absolute": 0.05,
+    "max_model_family_regression_absolute": 0.05,
+    "max_unauthorized_action_count": 0,
+    "max_resource_per_true_completion_ratio": 2.0
+  }
+}

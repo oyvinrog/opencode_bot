@@ -57,7 +57,6 @@ class Settings:
     stuck_timeout_seconds: int = 900
     pursuit_stuck_timeout_seconds: int = 600
     pursuit_tool_timeout_seconds: int = 300
-    pursuit_context_input_tokens: int = 250_000
     matrix_edit_interval_seconds: int = 5
 
     @classmethod
@@ -117,9 +116,6 @@ class Settings:
             ),
             pursuit_tool_timeout_seconds=env_positive_int(
                 "OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS", 300
-            ),
-            pursuit_context_input_tokens=env_positive_int(
-                "OPENCODE_PURSUE_CONTEXT_INPUT_TOKENS", 250_000
             ),
             matrix_edit_interval_seconds=env_positive_int(
                 "MATRIX_EDIT_INTERVAL_SECONDS", 5

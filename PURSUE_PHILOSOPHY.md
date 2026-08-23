@@ -1,217 +1,246 @@
 # The Philosophy Behind `!pursue`
 
-## Persistence Is Not Repetition
+`!pursue` exists to make a tool-using agent more likely to finish a real task,
+not merely to produce a longer answer. It is a bounded controller around one
+worker: make an attempt, check the resulting world, give failures back to the
+worker, and stop or ask the operator when continued work is no longer authorized.
+In unattended YOLO mode, one contract approval authorizes that loop until early
+verified completion, a genuine external blocker, an explicit stop, or a fixed
+deadline; internal accounting limits do not become interruptions.
 
-The purpose of `!pursue` is simple to state: give an agent a goal and let it keep
-working until there is good reason to believe the goal has been achieved. The
-important phrase is *good reason*. An agent that merely repeats the same request
-forever is persistent in a mechanical sense, but it is not persistent in the
-sense we care about. It can spend unlimited tokens reproducing the same mistaken
-assumption, searching the same places, or polishing an answer whose foundation
-is wrong.
+The design rests on three principles. They are deliberately narrower than the
+claims made by the earlier design.
 
-Real persistence is adaptive. A serious attempt at a goal must be able to notice
-failure, learn from evidence, change strategy, and distinguish movement from
-progress. This is the central philosophy of `!pursue`: perseverance should be a
-closed feedback loop, not an infinite prompt loop.
+1. **Reality decides.** Model prose cannot establish that model work is correct.
+2. **Complexity must earn its keep.** Additional inference, retries, memory, or
+   agents are features to test, not assumed improvements.
+3. **Reliability is a distribution.** A controller is useful only if it improves
+   repeated, end-to-end outcomes on representative tasks.
 
-The original `!obsess` command embodied useful stubbornness. It prevented the
-agent from treating the end of one model response as the end of the task. That
-was valuable, because language models are naturally organized around turns while
-many real goals require sustained work. But `!obsess` had no internal definition
-of success. It continued because it had been told to continue, not because it
-understood what remained unfinished. `!pursue` preserves the stubbornness while
-giving it direction.
+These principles are supported by direct research on language models and agents.
+They do not imply that `!pursue` is universally reliable, that any particular
+checker is sound, or that the current budget values are optimal.
 
-## Goals Need Observable Meaning
+## 1. Reality Decides
 
-A natural-language goal is rarely a complete specification. “Find a data
-engineering job near Oslo,” “explain this historical dispute,” and “fix the
-application” each leave different questions unanswered. What counts as a job
-being relevant? How current must the listing be? Which sources are authoritative?
-Which behavior demonstrates that the application is fixed?
+The worker may propose a plan, use tools, change files, and explain what it did.
+It may not turn those statements into proof of success. Completion is determined
+by a controller-recorded observation of the latest result.
 
-`!pursue` therefore begins by translating the request into a stable acceptance
-contract. The contract is not meant to replace the user's words. It makes their
-practical meaning explicit by identifying criteria that can be checked against
-the world. Harmless gaps can be covered by stated assumptions. A missing fact
-that would materially change the result should instead cause the pursuit to ask
-the user.
+This boundary follows the most consistent result in the self-correction
+literature. Kamoi et al.'s critical survey found no general demonstration of
+successful correction from feedback produced by prompted LLMs themselves,
+except on tasks unusually suited to self-correction; reliable external feedback
+and large-scale fine-tuning were materially different settings
+([TACL 2024](https://aclanthology.org/2024.tacl-1.78/)). Huang et al. found that
+intrinsic self-correction on reasoning tasks often failed to improve answers and
+could make them worse
+([ICLR 2024](https://proceedings.iclr.cc/paper_files/paper/2024/hash/8b4add8b0aa8749d80a34ca5d941c355-Abstract-Conference.html)).
+On three formal reasoning and planning domains, Stechly et al. observed
+performance collapse with self-critique and gains from sound external verifiers
+([ICLR 2025](https://proceedings.iclr.cc/paper_files/paper/2025/hash/f3c5e56274140e0420baa3916c529210-Abstract-Conference.html)).
 
-Before freezing that contract, the operator chooses an extent. Level 1 stops when
-the goal itself is evidenced. Level 2 also checks the important alternatives,
-edge cases, and contradictions. Level 3 maps every plausible avenue and continues
-until each has been checked or concrete attempts show that it is inaccessible;
-this can intentionally take hours. The chosen extent is part of the contract, so
-minimal evidence cannot prematurely complete a broad or exhaustive pursuit.
+Positive results have the same important qualifier. CRITIC improved results on
+the particular question-answering, mathematical/program-synthesis, and toxicity
+tasks it studied by placing tool feedback in the correction loop
+([ICLR 2024](https://proceedings.iclr.cc/paper_files/paper/2024/hash/fef126561bbf9d4467dbb8d27334b8fe-Abstract-Conference.html)).
+RefineBench evaluated 1,000 problems in 11 domains: unguided self-refinement was
+small or inconsistent for frontier models, whereas targeted checklist feedback
+made refinement much more effective for sufficiently capable models
+([ICLR 2026](https://proceedings.iclr.cc/paper_files/paper/2026/hash/835b6c04ca2daaa1a682c2eaad4a70ea-Abstract-Conference.html)).
+These studies support correction from relevant external feedback. They do not
+show that every test, search result, model judge, or checklist is trustworthy.
 
-Freezing the criteria matters. Without a stable contract, an agent can quietly
-move the goalposts until its current output appears successful. A frozen contract
-forces later evaluation to answer the harder question: did the work satisfy the
-original standard?
+### What Counts as Verification
 
-The standard must also fit the task. Software work can often be evaluated with
-tests, builds, reproduction steps, and inspection of the resulting files. Web
-research calls for different evidence: correct identification, current
-information, authoritative or primary sources, coverage of material claims, and
-attention to contradictory evidence. Analytical and subjective work needs an
-explicit rubric and honest separation between sourced facts, interpretations,
-and uncertainty. There is no universal test command for truth.
+`!pursue` recognizes three verification methods:
 
-## Action Must Meet the World
+- **Command verification** runs a contract-approved check against an isolated
+  snapshot of the result and records its raw output and exit status. Examples
+  include tests, builds, linters, and artifact validators.
+- **State verification** performs a read-only query for a specified environment
+  or API postcondition. The expected value is fixed in the approved contract.
+- **Human verification** is required when correctness depends on judgment or no
+  adequate objective checker is available. It never passes autonomously.
 
-The intellectual model behind `!pursue` is the cycle
+Only the controller creates a check result. Every result is tied to the contract
+version, worker attempt, and workspace or state revision that it observed. A
+later mutation invalidates affected results and requires new checks. Failed,
+unknown, duplicated, stale, or model-authored "evidence" cannot become a pass.
 
-> specify → act → observe → verify → reflect → replan
+The distinction matters most where fluent language resembles evidence. For
+research, retrieving a source can demonstrate that the source was accessed. It
+does not demonstrate that the source is true, that a paraphrase is faithful, or
+that the investigation is complete. Those claims need a suitable deterministic
+checker or human sign-off. The same caution applies to tests: passing an
+incomplete test suite proves only what that suite measures. External feedback is
+valuable only to the extent that the checker is relevant and sound, so checker
+scope and remaining uncertainty stay visible in the result.
 
-The worker does not succeed by producing plausible language. It acts through the
-tools available to it and collects observations: command output, test results,
-documents, source pages, database records, or other evidence supplied by the
-environment. This follows the broad insight of ReAct: reasoning becomes more
-reliable when it is interleaved with action and observation rather than conducted
-entirely inside a model's generated text.
+### The Contract Preserves Intent
 
-This distinction is especially important for internet research. A fluent answer
-about a current topic is not evidence that the answer is current. A cited URL is
-not evidence that the page supports the associated claim. Search results are
-leads, not conclusions. The agent must open sources, compare what they actually
-say, consider dates and provenance, and investigate meaningful disagreements.
-One decisive primary source may be stronger than ten derivative pages repeating
-one another, so verification should reward evidential quality rather than an
-arbitrary citation count.
+Before work starts, `!pursue` drafts a versioned contract containing the user's
+goal, authorization constraints, assumptions, acceptance criteria, verification
+method for each criterion, chosen extent, and finite budget. The user must
+approve it. A material revision creates a new version and requires approval
+again.
 
-More tokens create more opportunities to perform this work, but they do not make
-unsupported reasoning true. Compute is useful when it purchases additional
-experiments, searches, checks, and alternative strategies. Compute spent on
-repeating an ungrounded belief merely makes the belief more expensive.
+Approval is a product control, not an empirical claim that LLM-generated
+contracts are optimal. It prevents the controller from silently changing the
+goal, accepting unsafe authority, or choosing a weak proxy without showing the
+operator. The user's original request remains authoritative over the draft. If
+the draft selects unattended YOLO, approval also creates a pursuit-scoped lease
+bound to that contract's digest. A session-wide permission setting cannot
+authorize a new or revised contract.
 
-## The Worker Should Not Grade Its Own Exam
+The interactive lifecycle is:
 
-`!pursue` separates doing the work from deciding whether the work is finished.
-The worker operates in the main session. A separate verifier session receives the
-goal, the frozen criteria with controller-assigned IDs, the worker's report, and
-the accumulated evidence. It
-then checks the important claims independently before returning one of three
-judgments:
+> draft contract → await approval → work → check → repair, finish, or pause
 
-- `complete`: every mandatory criterion passes with concrete evidence;
-- `continue`: useful work remains, accompanied by a specific critique and next
-  direction;
-- `needs_input`: progress depends on a material fact or action that only the user
-  can provide.
+With unattended YOLO, the approved lease starts an absolute deadline when the
+worker launches:
 
-Separation does not make the verifier infallible. It may use the same underlying
-model, and it remains capable of error. Its value is procedural: a fresh role and
-separate context reduce the temptation to defend the worker's narrative, while
-independent tool use forces important claims back into contact with observable
-evidence. This reflects the lesson of research on language-agent reflection:
-feedback can improve later attempts, but intrinsic self-correction without
-external feedback can also preserve or worsen errors.
+> draft contract → await approval → work ↔ check/repair/rotate → verified result, true blocker, stop, or deadline
 
-The verifier is deliberately read-only in spirit. Its job is to inspect, test,
-search, and judge—not to quietly repair the work it is evaluating. If evaluation
-and intervention are mixed together, it becomes difficult to know whether the
-worker succeeded or the judge changed the answer until it passed.
+An objectively checked pursuit can reach `verified_complete` as soon as the
+latest checks pass. An interactive pursuit with unresolved human criteria reaches
+`awaiting_signoff`, with its result explicitly marked provisional; an unattended
+pursuit instead finishes provisionally without claiming human approval. Missing
+facts or authority produce `needs_input`, and an operator may always choose
+`stopped`. `budget_checkpoint` remains an interactive state, not a routine pause
+inside a valid unattended lease.
 
-## Memory Turns Failure Into Information
+## 2. Complexity Must Earn Its Keep
 
-An unsuccessful pass is not wasted if it changes the next pass. `!pursue`
-maintains bounded, durable records of accepted evidence, failed approaches,
-verifier feedback, assumptions, and the most important unresolved gap. This is a
-practical form of episodic memory inspired by Reflexion: the model's parameters do
-not change, but the controller carries forward a compact account of what
-experience has taught it.
+The default architecture is one capable worker receiving concrete failures from
+external checks. A new attempt is justified by a failed check or an unresolved
+criterion, not by a general instruction to think again. Work ends as soon as the
+latest applicable checks pass.
 
-Memory must be selective. An indefinitely growing transcript eventually becomes
-noisy, expensive, and difficult to reason over. It can anchor the model to early
-mistakes simply because those mistakes occupy so much context. `!pursue` retains
-the information needed for the decision—what has been established, what failed,
-and what remains—rather than treating every generated token as equally valuable.
+The reason is empirical rather than aesthetic. A controlled study of 260
+configurations across six agent benchmarks, five coordination architectures, and
+three model families found that multi-agent coordination ranged from substantial
+improvement to severe degradation depending on the task and architecture. The
+authors present their fitted threshold as a within-domain selection rule, not a
+universal scaling law
+([Nature Machine Intelligence 2026](https://www.nature.com/articles/s42256-026-01268-y)).
+Adaptive-Consistency reduced sampling by as much as 7.9 times across 17 reasoning
+and code-generation datasets and three models, with less than 0.1% average
+accuracy loss, by stopping sampling based on observed agreement
+([EMNLP 2023](https://aclanthology.org/2023.emnlp-main.761/)). That study concerns
+sample aggregation rather than long-running tool agents, but it is direct
+evidence that allocating the same inference budget to every problem is not
+automatically efficient.
 
-When the same unmet criteria recur for three cycles without new evidence, or the
-worker crosses its configured cumulative input-token threshold, the controller
-creates a fresh worker context supplied with the distilled memory and explicitly
-asks for a new strategy. Forgetting the conversational path while preserving the
-learned facts is a form of controlled escape from fixation.
+Consequently, verbal reflection memory, tree search, multiple candidates,
+parallel workers, model critics, recursive decomposition, and transcript
+summarization are disabled by default. Some have produced gains on particular
+benchmarks; none is accepted here as a universal law. Each may be promoted only
+after a matched OpenBot experiment shows a reproducible benefit for the task
+class where it will run.
 
-## Completion Is a Claim That Requires Evidence
+### Finite, Visible Budgets and Leases
 
-The worker is not allowed to terminate the pursuit merely by saying “done.” The
-verifier must account for every frozen criterion ID exactly once, assign it a
-status, and attach structured claim, source, and verification evidence to a
-passing judgment. A malformed or incomplete verdict is rejected. Protocol errors
-are repaired, and repeated protocol failure causes the verifier itself to be
-recreated from persisted state.
+Persistence is bounded. The initial budget is shown before approval:
 
-Automatic completion is therefore not the opposite of persistence. It is what
-makes persistence meaningful. An endless system cannot distinguish success from
-failure; it can only consume time. `!pursue` continues without an arbitrary pass
-or token ceiling, but it stops when the evidence warrants stopping.
+| Input / extent | Worker/check cycles | Tool calls | Input tokens | Wall time |
+| --- | ---: | ---: | ---: | ---: |
+| `1` — Focused | 4 | 40 | 250,000 | 60 minutes |
+| `2` — Thorough | 12 | 120 | 750,000 | 180 minutes |
+| `3` — Extended | 32 | 320 | 2,000,000 | 480 minutes |
 
-Persistence must not make the operator powerless. The human can inspect progress,
-stop the pursuit, or use `!bump` when a turn appears stalled. A bump is deliberately
-a two-step act: the system first reports how long the turn has been inactive, and
-the user must then confirm the interruption. If new activity appears in between,
-the confirmation expires. This preserves both autonomy and agency—the controller
-can work for a long time without supervision, while the person remains the final
-authority over whether a silent turn should be disturbed.
+The operator may instead enter a positive whole-minute or whole-hour duration,
+such as `90m` or `4h`, up to eight hours. Its cycle, tool-call, and input-token
+allowances scale at the hourly rates above. These numbers are OpenBot policy
+defaults. No cited experiment establishes them as optimal. They provide
+predictable operator control and measurable starting points for later tuning.
 
-Operator control is a supplement to autonomous recovery, not a prerequisite for
-it. A pursuit watchdog treats prolonged silence—and especially a tool that remains
-in a running state beyond its deadline—as evidence that the execution context may
-be poisoned. It aborts that context, quarantines it, records the stalled tool and
-failed approach in durable reflection memory, and resumes the same phase in a
-fresh worker or verifier session. The recovery deadline is visible in `!status`.
-This avoids depending on the broken session to announce that it has become idle,
-while preserving the evidence and acceptance contract accumulated before it froze.
+In interactive mode, reaching any limit creates a `budget_checkpoint`; it does
+not turn incomplete work into success. The operator may grant another visible
+tranche, revise and reapprove the contract, or stop.
 
-Some conditions should pause rather than complete or fail. The user may need to
-choose a region, authorize an action, provide credentials, resolve an ambiguity,
-or decide among genuinely different interpretations of the goal. Safety and
-permissions remain authoritative. “Do not give up” cannot mean “invent consent”
-or “silently choose a materially different objective.” When human input is
-essential, waiting is progress-preserving behavior.
+In unattended YOLO mode, wall time is the maximum lease duration and the absolute
+deadline never moves. Reaching a cycle, tool-call, or input-token allowance
+rotates to a fresh worker and renews that internal tranche automatically without
+a reply, while cumulative usage and the original deadline remain visible. Bot
+downtime counts against the lease. The controller resumes after restart only if
+time remains.
 
-## Reliability Without the Pretence of Certainty
+At the deadline, worker actions stop and one bounded, read-only final check
+records either the verified outcome or a terminal `deadline_reached` report. If
+only human checks remain, the terminal result is clearly provisional; the
+controller never fabricates sign-off. Before the deadline, only a true external
+blocker—missing credentials or authority, a material user-only fact, an
+unavailable required verifier, or an explicit non-retryable permission
+refusal—may pause unattended work. Transient permission failures are retried.
+`!yolo off` revokes the lease, and `!stop` remains immediate. A material contract
+revision always requires new approval and starts a new deadline.
 
-No controller can guarantee that an arbitrary goal will be reached. The world may
-not contain the requested information. Sources may be inaccessible. A software
-defect may depend on unavailable infrastructure. The model, worker, verifier, and
-tools can all fail. `!pursue` is designed to increase the probability of success,
-not to manufacture certainty.
+Automatic rotations and progress messages may be reported to the room, but they
+are notices rather than prompts. A message that actually requires approval,
+input, or a permission decision says so explicitly. There is no promise to try
+every plausible avenue, and consuming more compute is never evidence by itself.
 
-Its philosophy is therefore both ambitious and modest. It is ambitious about
-effort: difficulty alone is not a stopping condition, transient failures are
-retried, repeated strategies are replaced, and available local compute may be
-used fully. It is modest about knowledge: claims require evidence, assumptions
-must remain visible, contradictions deserve investigation, and unverifiable
-conclusions must not be presented as verified facts.
+## 3. Reliability Is a Distribution
 
-The command's name captures this balance. To pursue is to remain oriented toward
-a destination while adapting one's route. It is neither the passivity of a
-single answer nor the blindness of obsession. It is disciplined persistence:
-keep acting, keep learning, keep checking, and stop only when the goal has been
-earned by the evidence—or pause when continuing responsibly requires the human.
+An agent that succeeds once can still be operationally unreliable. `!pursue`
+therefore treats repeated full-task success—not a persuasive trace or selected
+demo—as the unit of progress.
 
-## Intellectual Background
+This distinction is substantial in agent systems. In the original `tau`-bench
+experiments, a leading function-calling agent completed fewer than half of tasks
+in the two tested domains, while the probability of succeeding on every one of
+eight repeated retail trials was below 25%
+([ICLR 2025](https://proceedings.iclr.cc/paper_files/paper/2025/hash/1b126cc38b8638e07bef37e7b2bb72bf-Abstract-Conference.html)).
+The benchmark's end-state comparison and repeated-run metric are useful design
+ideas, but its domains and simulated users do not establish OpenBot performance.
 
-The design is informed principally by:
+Evaluators can also be wrong. An audit of prominent agent benchmarks identified
+task-setup and reward defects capable of changing reported performance by up to
+100% in relative terms
+([NeurIPS 2025](https://proceedings.neurips.cc/paper_files/paper/2025/hash/f316275b44ee2de533102913828a8107-Abstract-Datasets_and_Benchmarks_Track.html)).
+This is why OpenBot must test the evaluator as carefully as the agent and inspect
+false completions, not only aggregate reward.
 
-- Shunyu Yao et al., [“ReAct: Synergizing Reasoning and Acting in Language
-  Models”](https://arxiv.org/abs/2210.03629), which interleaves reasoning, action,
-  and environmental observation.
-- Noah Shinn et al., [“Reflexion: Language Agents with Verbal Reinforcement
-  Learning”](https://arxiv.org/abs/2303.11366), which carries feedback and
-  reflection into later attempts through episodic memory.
-- Jie Huang et al., [“Large Language Models Cannot Self-Correct Reasoning
-  Yet”](https://arxiv.org/abs/2310.01798), which documents the limits of
-  correction performed without external feedback.
-- Shunyu Yao et al., [“Tree of Thoughts: Deliberate Problem Solving with Large
-  Language Models”](https://arxiv.org/abs/2305.10601), whose broader lesson is
-  that difficult problems benefit from evaluating alternatives and escaping
-  unproductive reasoning paths.
+### The Promotion Standard
 
-`!pursue` is not a literal implementation of any one paper. It is an engineering
-synthesis of their shared practical lesson: an agent becomes more capable not by
-thinking forever, but by organizing continued effort around feedback, memory,
-verification, and explicit criteria for success.
+Controller changes are evaluated against the deployed controller and a strong
+single-worker baseline with matched tasks, tools, permissions, information, and
+resource ceilings. A 40-task development suite is used for iteration. Promotion
+uses a separate frozen 120-task confirmation suite: 30 software tasks with hidden
+tests, 30 terminal/API tasks with target-state and policy graders, 30
+source-grounded research tasks with two blinded human reviewers, and 30
+impossible, underspecified, adversarial, or permission-bound tasks. Each
+task/controller combination receives five independent runs with the production
+model and with one different model family.
+
+The primary measurements are:
+
+- full task success at the true end state;
+- false completion, especially on objectively graded tasks;
+- repeated-run reliability;
+- unauthorized or unintended actions; and
+- resources per verified completion.
+
+A new mechanism ships by default only after the planned confirmation experiment
+shows at least a 10 percentage-point absolute success improvement with a
+task-clustered 95% confidence interval excluding zero, at least 50% fewer false
+completions when the baseline has any, and otherwise no increase with a 95%
+upper bound below 2% on objectively graded tasks. No task or model-family stratum
+may regress by more than five points; there must be zero unauthorized actions;
+and median resources per true completion may be no more than twice the stronger
+baseline. These thresholds are release policy, not natural constants; their
+purpose is to make "better" falsifiable.
+
+## What `!pursue` Does Not Claim
+
+`!pursue` cannot guarantee completion. The contract may encode the wrong proxy,
+tests may omit a defect, external state may change after observation, sources may
+be inaccessible, and a capable worker may still fail. Human sign-off can also be
+mistaken. A `verified_complete` result means that every objective criterion in
+the approved contract passed its latest applicable checker—not that all possible
+interpretations of the goal are true.
+
+The philosophy is therefore intentionally simple: let the model generate and
+repair; let observed outcomes determine what passed; add machinery only after it
+wins a fair experiment; and judge the controller across repeated complete tasks.
