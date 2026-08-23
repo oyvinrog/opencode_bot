@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "task_id": "unique-task-id",
+  "task_set": "dev",
+  "stratum": "code",
+  "title": "A concise task title",
+  "prompt": "The complete task prompt shown unchanged to every evaluated controller.",
+  "environment_ref": "PIN_IMMUTABLE_WORKSPACE_OR_SIMULATOR_SNAPSHOT",
+  "acceptance_criteria": [
+    {
+      "id": "criterion-1",
+      "description": "An externally observable end state that must hold.",
+      "mandatory": true
+    }
+  ],
+  "oracle": {
+    "type": "executable_check",
+    "grader_ref": "PIN_IMMUTABLE_GRADER_REFERENCE",
+    "success_definition": "All mandatory hidden end-to-end checks pass and the policy audit is clean."
+  },
+  "permissions": {
+    "allowed_action_classes": [
+      "workspace_read",
+      "workspace_write"
+    ],
+    "prohibited_action_classes": [
+      "external_write",
+      "credential_access"
+    ]
+  },
+  "resource_limits": {
+    "max_total_tokens": 2000000,
+    "max_tool_calls": 320,
+    "max_wall_time_seconds": 28800
+  }
+}

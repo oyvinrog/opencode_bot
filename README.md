@@ -104,7 +104,7 @@ and do not expose port 4096 publicly. The username defaults to `opencode`.
 - `!help` — show the command list
 - `!new [directory]` — create a new session, using the default directory when omitted
 - Ordinary messages — prompt the current session, creating one in the default directory if needed
-- `!pursue <goal>` — choose permission mode and extent 1–3, then pursue until independently verified or `!stop`
+- `!pursue <goal>` — approve a bounded, checkable contract, then work until it is verified or pauses
 - `!status` — show the session, directory, activity, permissions, and change totals
 - `!diagnose` — write `DIAGNOSIS.txt` in the mapped session directory
 - `!bump` — report inactivity and ask before restarting the same stalled turn
@@ -133,7 +133,7 @@ Matrix encrypted-media metadata.
 `!diagnose` snapshots the mapped room state, transient progress, the last 200
 OpenCode event records observed since the bot started (with adjacent token deltas
 compacted), server health/status, and up to
-100 recent messages plus diffs for the worker, verifier, and quarantined recovery
+100 recent messages plus diffs for the pursuit worker and quarantined recovery
 sessions. The report is written atomically with owner-only permissions and the bot
 replies with its absolute path. Credential-shaped fields and assignments are
 redacted, but arbitrary prompts, model/tool output, paths, and source diffs can
@@ -141,44 +141,62 @@ still contain private data. Inspect `DIAGNOSIS.txt` before copying or sharing it
 
 Starting a session posts a compact reminder of the available commands. `!pursue`
 first asks whether to enable session-scoped YOLO mode, accepting `y` or `n`. A `y`
-automatically approves future permission requests for the mapped session, including
-the pursuit worker and verifier; `n` disables YOLO even if it was previously enabled.
-It then asks for an extent: `1` reaches the evidenced goal, `2` checks the important
-alternatives and contradictions, and `3` systematically exhausts every plausible
-avenue and may run for hours. After the choice, it starts a fresh worker, preventing
-a large or poisoned ordinary-chat transcript from contaminating the pursuit. It also creates
-a separate verifier session that freezes task-aware acceptance criteria. The bot
-assigns stable IDs to those criteria, so completion does not depend on the model
-repeating punctuation exactly. Literal schema placeholders and duplicate criteria
-are rejected instead of becoming the contract. The worker then acts in repeated
-passes while the verifier independently checks evidence after every pass. Passing
-evidence records a claim, its direct source URL/file/check, and how the verifier
-checked it. The pursuit completes automatically only when all mandatory criteria
-pass. Material ambiguities pause for an ordinary Matrix reply; difficulty or lack
-of immediate progress does not stop the loop.
+automatically approves future permission requests for the mapped session and its
+pursuit worker; `n` disables YOLO even if it was previously enabled. It then asks
+for an extent with a visible initial budget:
 
-Pursuits survive bot restarts and have no overall pass or token limit. Verifier
-feedback, structured evidence, failed approaches, and unresolved gaps are
-persisted by criterion ID. A verdict is fully validated before any of its status or
-evidence is stored. Three passes with the same gap and no new evidence trigger a
-fresh worker context with that durable memory. The next pass also rotates to a
-fresh worker when cumulative input reaches
-`OPENCODE_PURSUE_CONTEXT_INPUT_TOKENS` (250,000 by default). Pursuit workers use
-direct, observable tools; delegated `task` calls are disabled. `!stop` clears the
-pursuit, aborts its active worker or verifier turn, and removes the temporary
-verifier session.
+| Extent | Worker/check cycles | Tool calls | Input tokens | Wall time |
+| --- | ---: | ---: | ---: | ---: |
+| `1` — Focused | 4 | 40 | 250,000 | 60 minutes |
+| `2` — Thorough | 12 | 120 | 750,000 | 180 minutes |
+| `3` — Extended | 32 | 320 | 2,000,000 | 480 minutes |
 
-When upgrading an active pursuit from the older free-form evidence protocol, the
-bot retains its goal and explicit `User clarification:` entries, creates fresh
-worker and verifier sessions, and regenerates the contract. Old OpenCode sessions
-remain available for audit, while old criteria and unverified evidence are not
-carried forward.
+These are finite product defaults, not claims that those values are optimal.
+After the extent choice, the bot drafts a versioned contract containing the goal,
+constraints, assumptions, acceptance criteria, a verification method for every
+criterion, and the selected budget. Review the draft and reply `approve` to start
+or `revise <changes>` to request a new version. Material changes always require a
+fresh approval. `stop` or `!stop` ends the pursuit.
 
-Verification adapts to the task: code work favors executable checks, web research
-checks source authority, identity, recency, claim coverage, and contradictions,
-and qualitative work uses a frozen rubric while separating sourced facts from
-inference. The verifier is instructed not to edit or take consequential actions;
-OpenCode's normal permissions still govern every tool call.
+An approved pursuit starts one fresh worker, preventing a large or poisoned
+ordinary-chat transcript from contaminating the work. Worker output is relayed as
+**unverified** until the controller runs the contract's checks. Command checks run
+against an isolated snapshot. State checks use read-only postcondition queries.
+Criteria that cannot be checked objectively are human criteria and never pass
+autonomously. Each controller-created result is tied to the contract version,
+attempt, and observed workspace or state revision; later mutations make affected
+results stale and force a fresh check. Failed, unknown, duplicate, stale, or
+model-authored evidence cannot complete a criterion.
+
+Failed checks are returned to the same worker for a bounded repair cycle. There
+is no separate LLM verifier and no free-form reflection loop. The pursuit reaches
+`verified_complete` only when every objective criterion passes against the latest
+result. If human criteria remain, it pauses at `awaiting_signoff` and labels the
+result provisional; `approve` signs off on that exact contract and result. A
+missing fact or authorization pauses at `needs_input` for an ordinary reply.
+
+Reaching any cycle, tool-call, input-token, or wall-time limit pauses at
+`budget_checkpoint`; it never converts incomplete work into success. Reply
+`continue` to grant another visible tranche, `revise <changes>` to create and
+review a new contract version, or `stop` to finish without verification. A
+revised contract still requires `approve`. The final report contains the usable
+result, assumptions, per-criterion checks, remaining uncertainty, resource usage,
+and artifact references.
+
+Pursuits and their budget ledgers survive bot restarts. Pursuit workers use
+direct, observable tools; delegated `task` calls are disabled. `!stop` aborts an
+active worker or check and records a stopped outcome. When upgrading a persisted
+protocol-v2 pursuit, the bot retains its goal and draft criteria, returns to
+contract approval, marks earlier prose evidence `legacy_untrusted`, and requires
+fresh controller checks. Old OpenCode sessions remain available for audit.
+
+Verification adapts conservatively to the task. Tests and builds can objectively
+check specified software behavior, and read-only API queries can check specified
+state. Retrieving a source proves access to that source, not the truth or quality
+of a synthesis; research and qualitative criteria therefore remain provisional
+unless a genuine objective checker exists or the user signs off. Checker limits
+and unresolved uncertainty remain visible. OpenCode's normal permissions govern
+worker actions, while controller checkers are isolated and non-mutating.
 
 Assistant text and safe progress are relayed through Matrix `m.replace` edits at
 most once per `MATRIX_EDIT_INTERVAL_SECONDS` (five seconds by default, to stay
@@ -200,7 +218,7 @@ only while the room has a pending request. During `!pursue` setup, `y` and `n`
 instead answer the explicit YOLO question; outside those two states they remain
 ordinary messages.
 `YOLO` approves all currently pending requests and automatically answers future
-requests for the mapped session, including pursuit worker and verifier sessions.
+requests for the mapped session, including its pursuit worker.
 It survives bot restarts, but `!new` and `!reset` clear it; `!yolo off` disables it.
 Automatic approvals do not override permissions OpenCode explicitly denies.
 
@@ -209,8 +227,8 @@ Ordinary turns use `OPENCODE_STUCK_TIMEOUT_SECONDS` (900 seconds by default).
 Pursuits use the shorter `OPENCODE_PURSUE_STUCK_TIMEOUT_SECONDS` (600 seconds),
 and a pursuit tool continuously reported as running has its own hard ceiling,
 `OPENCODE_PURSUE_TOOL_TIMEOUT_SECONDS` (300 seconds). A timeout aborts the turn,
-quarantines the poisoned pursuit worker or verifier session, and resumes the same
-phase in a fresh session with a durable warning not to repeat the failed approach.
+quarantines the poisoned pursuit worker, and resumes the same bounded attempt in
+a fresh worker session with the interrupted action recorded in the action trace.
 Each repeated recovery requires another full timeout, and `!stop` cancels automatic
 continuation. If OpenCode initially rejects the abort, the watchdog retries on its
 next 30-second check rather than waiting through another timeout. Pending permission

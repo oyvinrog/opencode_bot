@@ -5,13 +5,24 @@ from unittest.mock import AsyncMock
 
 from matrix_opencode_bot.bot import (
     MatrixOpenCodeBot,
-    _parse_pursuit_control,
     render_diffs,
     split_text,
 )
+from matrix_opencode_bot.checkers import CheckerExecution
 from matrix_opencode_bot.config import Settings
 from matrix_opencode_bot.opencode import OpenCodeError
-from matrix_opencode_bot.state import PendingPermission, RoomSession, StateStore
+from matrix_opencode_bot.state import (
+    PURSUIT_PROTOCOL_VERSION,
+    BudgetLedger,
+    PursuitBudget,
+    PursuitContract,
+    PursuitCriterion,
+    PursuitOutcome,
+    PendingPermission,
+    RoomSession,
+    StateStore,
+    VerificationKind,
+)
 
 
 def settings(tmp_path: Path, *, show_reasoning: bool = False) -> Settings:
@@ -79,19 +90,49 @@ def room(room_id: str = "!one:example"):
     return SimpleNamespace(room_id=room_id, encrypted=True)
 
 
-def criteria(*texts: str) -> list[dict[str, str]]:
-    return [
-        {"id": f"c{index}", "text": text}
-        for index, text in enumerate(texts, start=1)
-    ]
+def contract_control(
+    *criteria: dict[str, object],
+    constraints: list[str] | None = None,
+    assumptions: list[str] | None = None,
+    needs_input: bool = False,
+    question: str | None = None,
+) -> dict[str, object]:
+    return {
+        "type": "contract",
+        "constraints": constraints or ["Do not modify anything outside this workspace"],
+        "assumptions": assumptions or [],
+        "criteria": list(criteria),
+        "needs_input": needs_input,
+        "question": question,
+    }
 
 
-def evidence(
-    claim: str = "Independent inspection confirms the claim",
-    source: str = "/work/result.txt",
-    verification: str = "Opened the source and checked the relevant record",
-) -> list[dict[str, str]]:
-    return [{"claim": claim, "source": source, "verification": verification}]
+def state_criterion(
+    text: str = "The required artifact exists",
+    *,
+    path: str = "result.txt",
+) -> dict[str, object]:
+    return {
+        "text": text,
+        "verification": {"kind": "state", "path": path, "predicate": "exists"},
+    }
+
+
+def human_criterion(text: str = "The result meets the requested quality bar") -> dict[str, object]:
+    return {"text": text, "verification": {"kind": "human"}}
+
+
+async def begin_focused_pursuit(
+    bot: MatrixOpenCodeBot,
+    store: StateStore,
+    tmp_path: Path,
+    goal: str = "Produce a checked result",
+) -> RoomSession:
+    store.rooms["!one:example"] = RoomSession("ses_original", str(tmp_path))
+    await bot.command_pursue("!one:example", goal)
+    await bot.prompt("!one:example", "n")
+    await bot.prompt("!one:example", "1")
+    return store.rooms["!one:example"]
 
 
 async def pursuit_text_and_idle(
