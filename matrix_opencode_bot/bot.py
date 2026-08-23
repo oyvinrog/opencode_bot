@@ -952,6 +952,7 @@ class MatrixOpenCodeBot:
     async def _pause_stale_unattended_worker(
         self, room_id: str, state: RoomSession
     ) -> bool:
+        self._cancel_deadline_timer(room_id)
         session_id = (
             state.pursuit_termination_session_id
             if state.pursuit_termination_reason == "stale_authorization"
@@ -996,6 +997,54 @@ class MatrixOpenCodeBot:
         )
         return True
 
+    async def _pause_invalid_restored_contract(
+        self, room_id: str, state: RoomSession
+    ) -> bool:
+        self._cancel_deadline_timer(room_id)
+        session_id = (
+            state.pursuit_termination_session_id
+            if state.pursuit_termination_reason == "invalid_contract"
+            and state.pursuit_termination_session_id
+            else self._active_session_id(state)
+        )
+        state.pursuit_termination_reason = "invalid_contract"
+        state.pursuit_termination_session_id = session_id
+        await self.store.save()
+        try:
+            busy = (await self._status(state, session_id)).get("type") != "idle"
+        except OpenCodeError:
+            busy = True
+        if busy and not await self._confirm_session_stopped(state, session_id):
+            await self._mark_termination_pending(
+                room_id,
+                state,
+                reason="invalid_contract",
+                session_id=session_id,
+            )
+            return False
+        await self._capture_interrupted_worker_input_tokens(state)
+        if state.in_flight_event_id:
+            await self.finalize(
+                room_id,
+                state,
+                "Invalid placeholder acceptance contract detected after restart; "
+                "the worker was stopped and no status was promoted.",
+            )
+        self._cancel_session_permission_retries(room_id, state, session_id)
+        self._revoke_unattended_authorization(state, keep_requested=True)
+        state.pursuit_contract = None
+        state.acceptance_criteria.clear()
+        state.pursuit_check_results.clear()
+        state.pursuit_phase = "needs_input"
+        state.pursuit_pending_question = (
+            "The restored contract was invalid. Reply with guidance to redraft it."
+        )
+        self._clear_termination_marker(state)
+        await self.store.save()
+        if not state.in_flight_event_id:
+            await self.send_text(room_id, state.pursuit_pending_question)
+        return True
+
     async def _resume_pending_termination(
         self, room_id: str, state: RoomSession
     ) -> None:
@@ -1011,6 +1060,9 @@ class MatrixOpenCodeBot:
             return
         if reason == "stale_authorization":
             await self._pause_stale_unattended_worker(room_id, state)
+            return
+        if reason == "invalid_contract":
+            await self._pause_invalid_restored_contract(room_id, state)
             return
         if reason == "stop":
             session_id = state.pursuit_termination_session_id or self._active_session_id(
@@ -1756,25 +1808,36 @@ Delegated task/subagent calls are disabled."""
         operation: Any,
         *,
         timeout: float | None = None,
+        honor_deadline: bool = True,
     ) -> Any:
         operation_task = asyncio.create_task(operation)
         stop_task = asyncio.create_task(self.pursuit_stop_events[room_id].wait())
+        deadline_task = (
+            asyncio.create_task(self.pursuit_deadline_events[room_id].wait())
+            if honor_deadline
+            else None
+        )
+        tasks = {operation_task, stop_task}
+        if deadline_task is not None:
+            tasks.add(deadline_task)
         try:
             done, _ = await asyncio.wait(
-                {operation_task, stop_task},
+                tasks,
                 timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if operation_task in done:
-                return await operation_task
             if stop_task in done:
                 raise _PursuitCheckStopped
+            if deadline_task is not None and deadline_task in done:
+                raise _PursuitDeadlineReached
+            if operation_task in done:
+                return await operation_task
             raise TimeoutError
         finally:
-            for task in (operation_task, stop_task):
+            for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(operation_task, stop_task, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run_pursuit_checks(
         self,
@@ -1816,8 +1879,9 @@ Delegated task/subagent calls are disabled."""
                     if final_check_deadline is not None
                     else None
                 ),
+                honor_deadline=not deadline_final,
             )
-        except _PursuitCheckStopped:
+        except (_PursuitCheckStopped, _PursuitDeadlineReached):
             return
         except (TimeoutError, OSError, RuntimeError):
             fingerprint_available = False
@@ -1864,12 +1928,13 @@ Delegated task/subagent calls are disabled."""
                         room_id,
                         execute_criterion(criterion),
                         timeout=remaining,
+                        honor_deadline=False,
                     )
                 else:
                     execution = await self._await_checker_or_stop(
                         room_id, execute_criterion(criterion)
                     )
-            except _PursuitCheckStopped:
+            except (_PursuitCheckStopped, _PursuitDeadlineReached):
                 return
             except TimeoutError:
                 execution = CheckerExecution(
@@ -1897,8 +1962,9 @@ Delegated task/subagent calls are disabled."""
                     if final_check_deadline is not None
                     else None
                 ),
+                honor_deadline=not deadline_final,
             )
-        except _PursuitCheckStopped:
+        except (_PursuitCheckStopped, _PursuitDeadlineReached):
             return
         except (TimeoutError, OSError, RuntimeError):
             fingerprint_available = False
@@ -4238,43 +4304,20 @@ Delegated task/subagent calls are disabled."""
                         )
                     )
                     if invalid_persisted_contract:
-                        if state.in_flight_event_id:
-                            with contextlib.suppress(OpenCodeError):
-                                await self.opencode.abort(state.session_id, state.directory)
-                            await self.finalize(
-                                room_id,
-                                state,
-                                "Invalid placeholder acceptance contract detected after restart; "
-                                "no status was promoted.",
-                            )
-                        state.pursuit_contract = None
-                        state.acceptance_criteria.clear()
-                        state.pursuit_check_results.clear()
-                        state.pursuit_phase = "needs_input"
-                        state.pursuit_pending_question = (
-                            "The restored contract was invalid. Reply with guidance to redraft it."
-                        )
+                        await self._pause_invalid_restored_contract(room_id, state)
                         changed = True
+                        if state.pursuit_termination_reason:
+                            continue
                     if (
                         state.pursuit_goal
                         and state.pursuit_contract
                         and not state.pursuit_contract.approval_is_current()
                         and state.pursuit_phase in {"working", "checking"}
                     ):
-                        if state.in_flight_event_id:
-                            with contextlib.suppress(OpenCodeError):
-                                await self.opencode.abort(state.session_id, state.directory)
-                            await self.finalize(
-                                room_id,
-                                state,
-                                "Restored work paused because its contract approval is stale.",
-                            )
-                        if state.pursuit_unattended:
-                            self._revoke_unattended_authorization(
-                                state, keep_requested=True
-                            )
-                        state.pursuit_phase = "awaiting_approval"
+                        await self._pause_stale_unattended_worker(room_id, state)
                         changed = True
+                        if state.pursuit_termination_reason:
+                            continue
                     if state.in_flight_event_id:
                         # Do not immediately interrupt a restored run based on an old prompt
                         # timestamp. Give it a complete silence window after this process starts.
