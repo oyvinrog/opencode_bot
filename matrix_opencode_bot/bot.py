@@ -97,6 +97,10 @@ class _PursuitCheckStopped(Exception):
     """An authorized !stop arrived while a controller check was running."""
 
 
+class _PursuitDeadlineReached(Exception):
+    """The fixed unattended deadline arrived during a normal check batch."""
+
+
 def _pursuit_budget_instruction(
     budget: PursuitBudget, *, unattended: bool = False
 ) -> str:
@@ -148,7 +152,7 @@ def _parse_pursuit_budget_choice(value: str) -> tuple[int, PursuitBudget] | None
 HELP = """Matrix–OpenCode commands:
 !new [directory] — start a session
 Ordinary messages — prompt the current session, creating one if needed
-!pursue <goal> — approve a bounded contract, then pursue unattended in YOLO mode
+!pursue <goal> — approve a bounded contract; YOLO can run it unattended to a fixed deadline
 !status — show current activity
 !diagnose — write a detailed DIAGNOSIS.txt in the session directory
 !bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
@@ -197,6 +201,9 @@ class MatrixOpenCodeBot:
         self.permission_retry_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self.deadline_tasks: dict[str, asyncio.Task[None]] = {}
         self.pursuit_stop_events: defaultdict[str, asyncio.Event] = defaultdict(
+            asyncio.Event
+        )
+        self.pursuit_deadline_events: defaultdict[str, asyncio.Event] = defaultdict(
             asyncio.Event
         )
         self.last_edit: dict[str, float] = {}
@@ -626,6 +633,7 @@ class MatrixOpenCodeBot:
         task = self.deadline_tasks.pop(room_id, None)
         if task and task is not asyncio.current_task():
             task.cancel()
+        self.pursuit_deadline_events.pop(room_id, None)
 
     def _schedule_deadline_timer(self, room_id: str, state: RoomSession) -> None:
         self._cancel_deadline_timer(room_id)
@@ -637,8 +645,16 @@ class MatrixOpenCodeBot:
 
         async def expire() -> None:
             try:
-                delay = max(0.0, (deadline_ms - int(time.time() * 1000)) / 1000)
-                await asyncio.sleep(delay)
+                while True:
+                    delay = max(
+                        0.0,
+                        (deadline_ms - int(time.time() * 1000)) / 1000,
+                    )
+                    await asyncio.sleep(delay)
+                    if int(time.time() * 1000) >= deadline_ms:
+                        break
+                # Interrupt a normal checker before waiting for the room lock.
+                self.pursuit_deadline_events[room_id].set()
                 async with self.room_locks[room_id]:
                     if (
                         self.store.rooms.get(room_id) is not state
@@ -823,6 +839,7 @@ class MatrixOpenCodeBot:
     async def _handle_unattended_deadline(
         self, room_id: str, state: RoomSession
     ) -> bool:
+        self._cancel_deadline_timer(room_id)
         if not state.pursuit_goal:
             return False
         if state.in_flight_event_id:
@@ -1281,6 +1298,7 @@ value and omitting unused checker variants:
     async def _request_contract_revision(
         self, room_id: str, state: RoomSession, request: str
     ) -> None:
+        self._cancel_deadline_timer(room_id)
         self._revoke_unattended_authorization(state, keep_requested=True)
         self._cancel_session_permission_retries(
             room_id, state, self._active_session_id(state)
@@ -1363,6 +1381,8 @@ value and omitting unused checker variants:
         state.pursuit_budget_ledger = ledger
         state.pursuit_workspace_fingerprint = fingerprint
         await self.store.save()
+        if unattended:
+            self._schedule_deadline_timer(room_id, state)
         if ledger.exhausted_limits():
             await self._enter_budget_checkpoint(room_id, state, ledger.exhausted_limits())
             return
@@ -1678,6 +1698,7 @@ Delegated task/subagent calls are disabled."""
             if state.pursuit_budget_ledger:
                 state.pursuit_budget_ledger.pause()
             if state.pursuit_unattended:
+                self._cancel_deadline_timer(room_id)
                 self._expire_unattended_authorization(state)
             question = blocker["question"]
             state.pursuit_phase = "needs_input"
@@ -1782,6 +1803,7 @@ Delegated task/subagent calls are disabled."""
             if deadline_final
             else None
         )
+        fingerprint_available = True
         try:
             before = await self._await_checker_or_stop(
                 room_id,
@@ -1797,7 +1819,8 @@ Delegated task/subagent calls are disabled."""
             )
         except _PursuitCheckStopped:
             return
-        except TimeoutError:
+        except (TimeoutError, OSError, RuntimeError):
+            fingerprint_available = False
             before = state.pursuit_workspace_fingerprint or ""
         observed: list[tuple[PursuitCriterion, CheckerExecution]] = []
 
@@ -1877,9 +1900,10 @@ Delegated task/subagent calls are disabled."""
             )
         except _PursuitCheckStopped:
             return
-        except TimeoutError:
+        except (TimeoutError, OSError, RuntimeError):
+            fingerprint_available = False
             after = before
-        checker_mutated = after != before
+        checker_mutated = not fingerprint_available or after != before
         if checker_mutated:
             state.mark_workspace_mutated(
                 "checker-read-only-violation", workspace_fingerprint=after
@@ -2028,6 +2052,9 @@ Delegated task/subagent calls are disabled."""
             ledger = state.pursuit_budget_ledger
             if ledger:
                 ledger.pause()
+            if state.pursuit_unattended:
+                self._cancel_deadline_timer(room_id)
+                self._expire_unattended_authorization(state)
             state.pursuit_phase = "needs_input"
             state.pursuit_outcome = PursuitOutcome.NEEDS_INPUT
             question = (
@@ -2364,7 +2391,10 @@ Delegated task/subagent calls are disabled."""
         outcome: PursuitOutcome,
         uncertainty: list[str],
     ) -> None:
+        if self.pursuit_stop_events[room_id].is_set():
+            return
         self.pursuit_stop_events.pop(room_id, None)
+        self._cancel_deadline_timer(room_id)
         for retry_room, permission_id in list(self.permission_retry_tasks):
             if retry_room == room_id:
                 self._cancel_permission_retry(retry_room, permission_id)
@@ -2564,10 +2594,31 @@ Delegated task/subagent calls are disabled."""
             lines.append(
                 f"Retry: attempt {status.get('attempt', '?')} — {status.get('message', 'waiting')}"
             )
+        if not state.yolo_permissions:
+            permission_mode = "prompt"
+        elif not state.pursuit_goal and state.yolo_session_id in {
+            None,
+            self._active_session_id(state),
+        }:
+            permission_mode = "YOLO (auto-approve for current session)"
+        elif state.pursuit_goal and (
+            (
+                self._unattended_authorization_is_current(state)
+                and not self._unattended_deadline_expired(state)
+            )
+            or (
+                state.yolo_session_id == self._active_session_id(state)
+                and state.pursuit_contract
+                and state.yolo_contract_digest
+                == state.pursuit_contract.content_digest()
+            )
+        ):
+            permission_mode = "YOLO (auto-approve for current worker/contract)"
+        else:
+            permission_mode = "YOLO configured, but not authorized for current worker"
         lines.extend(
             [
-                "Permission mode: "
-                + ("YOLO (auto-approve)" if state.yolo_permissions else "prompt"),
+                "Permission mode: " + permission_mode,
                 f"Pending permissions: {len(state.pending_permissions)}",
                 f"Changes: {len(diffs)} files, +{additions}/-{deletions}",
             ]
@@ -3071,6 +3122,7 @@ Delegated task/subagent calls are disabled."""
                 "Usage: !yolo off (YOLO can only be enabled from a permission prompt).",
             )
             return
+        self._cancel_deadline_timer(room_id)
         state.yolo_permissions = False
         state.yolo_session_id = None
         state.yolo_contract_digest = None
@@ -3192,6 +3244,7 @@ Delegated task/subagent calls are disabled."""
         for retry_room, permission_id in list(self.permission_retry_tasks):
             if retry_room == room_id:
                 self._cancel_permission_retry(retry_room, permission_id)
+        self._cancel_deadline_timer(room_id)
         active_session_id = self._active_session_id(state)
         # Revoke authority before the first network operation. A failed status
         # lookup must never leave a worker eligible for more YOLO approvals.
@@ -4270,6 +4323,11 @@ Delegated task/subagent calls are disabled."""
                 if state.pursuit_termination_reason:
                     await self._resume_pending_termination(room_id, state)
                     continue
+                if (
+                    self._unattended_authorization_is_current(state)
+                    and not self._unattended_deadline_expired(state)
+                ):
+                    self._schedule_deadline_timer(room_id, state)
                 if self._unattended_deadline_expired(state):
                     if state.pursuit_phase == "needs_input":
                         self._cancel_session_permission_retries(
@@ -4554,6 +4612,8 @@ Delegated task/subagent calls are disabled."""
             task.cancel()
         for task in self.permission_retry_tasks.values():
             task.cancel()
+        for task in self.deadline_tasks.values():
+            task.cancel()
         if self.edit_tasks:
             await asyncio.gather(*self.edit_tasks.values(), return_exceptions=True)
         if self.retry_tasks:
@@ -4561,6 +4621,10 @@ Delegated task/subagent calls are disabled."""
         if self.permission_retry_tasks:
             await asyncio.gather(
                 *self.permission_retry_tasks.values(), return_exceptions=True
+            )
+        if self.deadline_tasks:
+            await asyncio.gather(
+                *self.deadline_tasks.values(), return_exceptions=True
             )
 
 
