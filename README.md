@@ -82,6 +82,38 @@ client. The bot refuses to send to unverified recipient devices by default.
 `MATRIX_IGNORE_UNVERIFIED_DEVICES=true` permits unattended use but weakens device
 identity assurance; message contents remain encrypted.
 
+## Background service
+
+On a Linux system using systemd, install the bot as a system service after
+configuring `.env`:
+
+```bash
+./install.sh
+```
+
+The installer creates or updates `.venv`, installs the project, validates the
+configuration, and prompts for `sudo` to install the service. The bot starts
+immediately, restarts after a failure, and starts during machine boot without
+requiring a user login. The service refers to this repository by its absolute
+path, so rerun the installer after moving the repository.
+
+Use systemd to inspect or manage it:
+
+```bash
+sudo systemctl status matrix-opencode-bot.service
+sudo journalctl -u matrix-opencode-bot.service -f
+sudo systemctl restart matrix-opencode-bot.service
+```
+
+Remove the background service with:
+
+```bash
+./uninstall.sh
+```
+
+Uninstalling preserves `.env`, `.venv`, the Matrix session and encryption
+store, room mappings, and all bot data.
+
 ## Access policy
 
 `MATRIX_ALLOWED_ROOMS` and `MATRIX_ALLOWED_SENDERS` are mandatory comma-separated
