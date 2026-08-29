@@ -67,7 +67,12 @@ def make_bot(tmp_path: Path, *, show_reasoning: bool = False):
         user_id="@bot:example",
         rooms={},
         room_send=AsyncMock(side_effect=room_send),
-        upload=AsyncMock(),
+        upload=AsyncMock(
+            return_value=(
+                SimpleNamespace(content_uri="mxc://example/generated"),
+                {"key": {}, "iv": "iv", "hashes": {}, "v": "v2"},
+            )
+        ),
     )
     opencode = SimpleNamespace(
         health=AsyncMock(return_value={"healthy": True, "version": "test"}),
@@ -390,6 +395,18 @@ async def test_send_rejects_paths_outside_workspace(tmp_path: Path) -> None:
     assert "No file matching" in matrix.room_send.await_args.kwargs["content"]["body"]
 
 
+async def test_test_file_uses_generated_attachment_path(tmp_path: Path) -> None:
+    bot, matrix, _, _ = make_bot(tmp_path)
+    matrix.rooms = {"!one:example": SimpleNamespace(encrypted=False)}
+
+    await bot.on_message(room(), message(bot, "!test_file"))
+
+    assert matrix.upload.await_args.kwargs["filename"] == "file-send-test.txt"
+    content = matrix.room_send.await_args.kwargs["content"]
+    assert content["msgtype"] == "m.file"
+    assert content["body"] == "file-send-test.txt"
+
+
 async def test_diagnose_writes_redacted_local_report(tmp_path: Path) -> None:
     bot, matrix, opencode, store = make_bot(tmp_path)
     state = RoomSession("ses_1", str(tmp_path), pursuit_goal="Investigate failure")
@@ -485,8 +502,12 @@ async def test_pursue_requires_contract_approval_then_checks_and_completes(
     assert state.pursuit_outcome is PursuitOutcome.VERIFIED_COMPLETE
     assert state.pursuit_history[-1].outcome is PursuitOutcome.VERIFIED_COMPLETE
     assert state.pursuit_history[-1].check_results[0].status is CriterionStatus.PASS
-    final = matrix.room_send.await_args.kwargs["content"]["body"]
-    assert "verified_complete" in final
+    sent = [call.kwargs["content"] for call in matrix.room_send.await_args_list]
+    assert any("verified_complete" in item["body"] for item in sent)
+    attachment = sent[-1]
+    assert attachment["msgtype"] == "m.file"
+    assert attachment["body"].startswith("pursuit-report-verified-complete-")
+    assert attachment["body"].endswith(".md")
 
 
 async def test_pursue_in_new_room_starts_session_then_asks_for_yolo(

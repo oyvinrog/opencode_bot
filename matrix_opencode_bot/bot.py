@@ -177,6 +177,7 @@ Ordinary messages — prompt the current session, creating one if needed
 !diagnose — write a detailed DIAGNOSIS.txt in the session directory
 !bump [confirm|cancel] — inspect inactivity and optionally restart a stalled turn
 !send <filename> — find and send a file from the session directory
+!test_file — immediately send a small test attachment
 !yolo off — disable automatic permission approval and revoke active unattended continuation
 !diff — show changed files
 !stop — stop a pursuit and abort the current operation
@@ -184,7 +185,8 @@ Ordinary messages — prompt the current session, creating one if needed
 !help — show this message"""
 
 SESSION_REMINDER = (
-    "Commands: !new [directory], !pursue <goal>, !status, !diagnose, !bump, !send, !diff, "
+    "Commands: !new [directory], !pursue <goal>, !status, !diagnose, !bump, !send, "
+    "!test_file, !diff, "
     "!yolo off, !stop, !reset, !help"
 )
 STARTUP_LOGO_PATH = Path(__file__).with_name("assets") / "openbot-logo.png"
@@ -307,6 +309,8 @@ class MatrixOpenCodeBot:
                 await self.command_diff(room_id)
             elif command == "!send":
                 await self.command_send(room_id, argument.strip())
+            elif command == "!test_file":
+                await self.command_test_file(room_id)
             elif command == "!stop":
                 await self.command_stop(room_id)
             elif command == "!reset":
@@ -2524,6 +2528,7 @@ Delegated task/subagent calls are disabled."""
         self.pursuit_stop_events.pop(room_id, None)
         prefix = "✅ " if outcome == PursuitOutcome.VERIFIED_COMPLETE else ""
         await self.send_text(room_id, prefix + report)
+        await self._send_pursuit_report_file(room_id, report, outcome)
 
     @staticmethod
     def _clear_pursuit(
@@ -3348,6 +3353,17 @@ Delegated task/subagent calls are disabled."""
             LOG.warning("Could not send %s to %s: %s", selected, room_id, exc)
             await self.send_text(room_id, f"Could not send {selected.name}: {exc}")
 
+    async def command_test_file(self, room_id: str) -> None:
+        """Exercise the same generated-file upload path used by pursuit reports."""
+
+        generated = datetime.now(timezone.utc).isoformat()
+        content = (
+            "OpenBot file attachment test\n\n"
+            f"Generated: {generated}\n"
+            "If you can open this file, generated pursuit report delivery works.\n"
+        )
+        await self._send_generated_file(room_id, "file-send-test.txt", content)
+
     async def command_stop(self, room_id: str) -> None:
         state = self.store.rooms.get(room_id)
         if not state:
@@ -3403,6 +3419,7 @@ Delegated task/subagent calls are disabled."""
     ) -> None:
         self.pursuit_stop_events.pop(room_id, None)
         was_pursuing = state.pursuit_goal is not None or state.pending_pursuit_goal is not None
+        report: str | None = None
         await self._capture_interrupted_worker_input_tokens(state)
         self._cancel_session_permission_retries(room_id, state, session_id)
         if state.in_flight_event_id:
@@ -3439,6 +3456,8 @@ Delegated task/subagent calls are disabled."""
         else:
             message = "Stop requested and confirmed."
         await self.send_text(room_id, message)
+        if report is not None:
+            await self._send_pursuit_report_file(room_id, report, PursuitOutcome.STOPPED)
 
     async def command_reset(self, room_id: str) -> None:
         state = self.store.rooms.get(room_id)
@@ -4702,6 +4721,33 @@ Delegated task/subagent calls are disabled."""
         except OlmUnverifiedDeviceError as exc:
             raise RuntimeError("the room has unverified devices") from exc
         self.last_edit[room_id] = time.monotonic()
+
+    async def _send_generated_file(
+        self, room_id: str, filename: str, content: str
+    ) -> bool:
+        """Send generated text without leaving an artifact in the workspace."""
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="openbot-report-") as temporary:
+                path = Path(temporary) / filename
+                path.write_text(content, encoding="utf-8")
+                await self.send_file(room_id, path)
+        except (OSError, RuntimeError) as exc:
+            LOG.warning("Could not send generated file %s to %s: %s", filename, room_id, exc)
+            await self.send_text(room_id, f"Could not attach {filename}: {exc}")
+            return False
+        return True
+
+    async def _send_pursuit_report_file(
+        self, room_id: str, report: str, outcome: PursuitOutcome
+    ) -> bool:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        outcome_name = outcome.value.replace("_", "-")
+        return await self._send_generated_file(
+            room_id,
+            f"pursuit-report-{outcome_name}-{timestamp}.md",
+            report.rstrip() + "\n",
+        )
 
     async def send_edit(self, room_id: str, event_id: str, body: str) -> None:
         content = {
