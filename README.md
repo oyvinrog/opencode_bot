@@ -8,8 +8,8 @@ An end-to-end encrypted Matrix bot that controls an OpenCode coding session. Eac
 authorized Matrix room maps to one OpenCode session, ordinary messages become
 prompts, and responses are streamed back by editing a Matrix message.
 
-The bot connects to an `opencode serve` process through its HTTP API. The included
-`run.sh` launcher starts and supervises both processes for local use.
+The bot connects to an `opencode serve` process through its HTTP API. The
+installed systemd service starts and supervises both processes.
 
 ## Example chats
 
@@ -35,36 +35,19 @@ pip install -e .
 cp .env.example .env
 ```
 
-After configuring `.env`, start both OpenCode and the bot with:
+After configuring `.env`, install and start both OpenCode and the bot with:
 
 ```bash
-./run.sh
+./install.sh
 ```
 
-The launcher loads `.env`, starts OpenCode when needed, waits for it to become
+The service loads `.env`, starts OpenCode when needed, waits for it to become
 healthy, then starts the bot. If a healthy server is already listening at
-`OPENCODE_URL`, the launcher reuses it and leaves it running when the bot stops.
-Otherwise, Ctrl-C stops both processes. By default OpenCode serves on
+`OPENCODE_URL`, the service reuses it and leaves it running when the bot stops.
+Otherwise, stopping the service stops both processes. By default OpenCode serves on
 `127.0.0.1:4096`; optional `OPENCODE_SERVER_HOSTNAME` and
 `OPENCODE_SERVER_PORT` values in `.env` can change that, and `OPENCODE_URL` must
 point to the same address.
-
-To run the processes separately instead, start OpenCode on loopback with Basic
-Auth (using the same password as `.env`):
-
-```bash
-OPENCODE_SERVER_PASSWORD='a-strong-separate-password' \
-  opencode serve --hostname 127.0.0.1 --port 4096
-```
-
-Then load the configuration and run the bot in another terminal:
-
-```bash
-set -a
-. ./.env
-set +a
-matrix-opencode
-```
 
 The first run logs in with `MATRIX_PASSWORD`, creates a Matrix device, and stores
 the access token and encryption keys under `MATRIX_DATA_DIR`. Remove the Matrix
@@ -100,10 +83,15 @@ path, so rerun the installer after moving the repository.
 Use systemd to inspect or manage it:
 
 ```bash
+./run.sh
+./restart.sh
 sudo systemctl status matrix-opencode-bot.service
 sudo journalctl -u matrix-opencode-bot.service -f
-sudo systemctl restart matrix-opencode-bot.service
 ```
+
+`run.sh` starts the installed service only when it is stopped; it never starts
+a second bot process. `restart.sh` always restarts the installed service. If the
+service has not been installed, both scripts direct you to `install.sh`.
 
 Stop the bot temporarily, for example before updating the repository, with:
 

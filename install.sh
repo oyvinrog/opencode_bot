@@ -44,7 +44,7 @@ python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' \
     || die "Python 3.11 or newer is required (found $(python3 --version 2>&1))."
 [[ -f "$project_dir/.env" ]] \
     || die "missing $project_dir/.env; copy .env.example and configure it first."
-[[ -x "$project_dir/run.sh" ]] || die "$project_dir/run.sh is not executable."
+[[ -x "$project_dir/service.sh" ]] || die "$project_dir/service.sh is not executable."
 
 if [[ ! -x "$project_dir/.venv/bin/python" ]]; then
     echo "Creating Python virtual environment..."
@@ -57,7 +57,7 @@ run_as_install_user "$project_dir/.venv/bin/python" \
     || die "$project_dir/.venv must use Python 3.11 or newer."
 
 echo "Installing Matrix OpenCode bot dependencies..."
-run_as_install_user "$project_dir/.venv/bin/pip" install -e "$project_dir" \
+run_as_install_user "$project_dir/.venv/bin/python" -m pip install -e "$project_dir" \
     || die "dependency installation failed."
 
 echo "Validating bot configuration..."
@@ -76,7 +76,7 @@ chmod 600 "$project_dir/.env" || die "could not restrict permissions on $project
 unit_file="$(mktemp)"
 trap 'rm -f "$unit_file"' EXIT
 quoted_project_dir="$(systemd_quote "$project_dir")"
-quoted_run_script="$(systemd_quote "$project_dir/run.sh")"
+quoted_service_script="$(systemd_quote "$project_dir/service.sh")"
 
 {
     echo "# Managed by $project_dir/install.sh"
@@ -90,7 +90,7 @@ quoted_run_script="$(systemd_quote "$project_dir/run.sh")"
     echo "User=$install_user"
     echo "Group=$install_group"
     echo "WorkingDirectory=$quoted_project_dir"
-    echo "ExecStart=$quoted_run_script"
+    echo "ExecStart=$quoted_service_script"
     echo "Restart=on-failure"
     echo "RestartSec=10s"
     echo "UMask=0077"
