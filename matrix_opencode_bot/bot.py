@@ -25,9 +25,10 @@ from pathlib import Path
 from typing import Any
 
 from nio import (
-    AsyncClient,
+    AsyncClient as NioAsyncClient,
     AsyncClientConfig,
     InviteMemberEvent,
+    KeysUploadResponse,
     LoginResponse,
     MatrixRoom,
     RoomMessageText,
@@ -61,6 +62,40 @@ from .state import (
 )
 
 LOG = logging.getLogger("matrix_opencode")
+
+
+class AsyncClient(NioAsyncClient):
+    """matrix-nio client tolerant of incomplete successful key-upload replies."""
+
+    async def create_matrix_response(
+        self,
+        response_class: type,
+        transport_response,
+        data: tuple | None = None,
+        save_to: os.PathLike | None = None,
+    ):
+        if response_class is KeysUploadResponse and 200 <= transport_response.status < 300:
+            parsed = await self.parse_body(transport_response)
+            counts = parsed.get("one_time_key_counts") if isinstance(parsed, dict) else None
+            max_count = self.olm.account.max_one_time_keys if self.olm else 0
+            if not isinstance(counts, dict):
+                LOG.warning(
+                    "Homeserver omitted one_time_key_counts from a successful "
+                    "key upload; assuming the uploaded pool contains %d keys",
+                    max_count,
+                )
+                counts = {}
+            response = KeysUploadResponse(
+                int(counts.get("curve25519", 0)),
+                int(counts.get("signed_curve25519", max_count)),
+            )
+            response.transport_response = transport_response
+            return response
+        return await super().create_matrix_response(
+            response_class, transport_response, data, save_to
+        )
+
+
 MAX_MESSAGE_CHARS = 20_000
 MAX_REASONING_CHARS = 8_000
 WATCHDOG_POLL_SECONDS = 30.0

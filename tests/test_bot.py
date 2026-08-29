@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from nio import KeysUploadResponse
 
 from matrix_opencode_bot.bot import (
+    AsyncClient,
     PURSUIT_FEEDBACK_OUTPUT_BUDGET,
     MatrixOpenCodeBot,
     render_diffs,
@@ -2668,3 +2670,32 @@ def test_worker_prompt_omits_checker_output_when_none_was_recorded(
 
     assert feedback[0]["status"] == "human_pending"
     assert "checker_output" not in feedback[0]
+
+
+async def test_key_upload_response_defaults_missing_server_counts(caplog) -> None:
+    client = object.__new__(AsyncClient)
+    client.olm = SimpleNamespace(account=SimpleNamespace(max_one_time_keys=100))
+    client.parse_body = AsyncMock(return_value={})
+    transport = SimpleNamespace(status=200)
+
+    response = await client.create_matrix_response(KeysUploadResponse, transport)
+
+    assert response.curve25519_count == 0
+    assert response.signed_curve25519_count == 100
+    assert response.transport_response is transport
+    assert "omitted one_time_key_counts" in caplog.text
+
+
+async def test_key_upload_response_preserves_reported_counts() -> None:
+    client = object.__new__(AsyncClient)
+    client.olm = SimpleNamespace(account=SimpleNamespace(max_one_time_keys=100))
+    client.parse_body = AsyncMock(return_value={
+        "one_time_key_counts": {"curve25519": 3, "signed_curve25519": 47}
+    })
+
+    response = await client.create_matrix_response(
+        KeysUploadResponse, SimpleNamespace(status=200)
+    )
+
+    assert response.curve25519_count == 3
+    assert response.signed_curve25519_count == 47
