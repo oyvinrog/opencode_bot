@@ -79,6 +79,8 @@ configuration, and prompts for `sudo` to install the service. The bot starts
 immediately, restarts after a failure, and starts during machine boot without
 requiring a user login. The service refers to this repository by its absolute
 path, so rerun the installer after moving the repository.
+Rerun it after updating the repository as well, so dependencies and the unit
+definition stay current.
 
 Use systemd to inspect or manage it:
 

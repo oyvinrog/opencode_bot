@@ -33,7 +33,10 @@ else
 fi
 
 echo "Starting $service_name..."
-"${as_root[@]}" systemctl start "$service_name"
+if ! "${as_root[@]}" systemctl start "$service_name"; then
+    "${as_root[@]}" systemctl --no-pager --full status "$service_name" >&2 || true
+    die "could not start $service_name. Run ./install.sh to repair its unit."
+fi
 if ! systemctl is-active --quiet "$service_name"; then
     "${as_root[@]}" systemctl --no-pager --full status "$service_name" >&2 || true
     die "$service_name did not start."

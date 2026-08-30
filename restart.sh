@@ -23,7 +23,10 @@ else
 fi
 
 echo "Restarting $service_name..."
-"${as_root[@]}" systemctl restart "$service_name"
+if ! "${as_root[@]}" systemctl restart "$service_name"; then
+    "${as_root[@]}" systemctl --no-pager --full status "$service_name" >&2 || true
+    die "could not restart $service_name. Run ./install.sh to repair its unit."
+fi
 if ! systemctl is-active --quiet "$service_name"; then
     "${as_root[@]}" systemctl --no-pager --full status "$service_name" >&2 || true
     die "$service_name did not restart."

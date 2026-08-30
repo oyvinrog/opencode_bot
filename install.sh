@@ -28,14 +28,6 @@ run_as_install_user() {
     fi
 }
 
-systemd_quote() {
-    local value="$1"
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    value="${value//%/%%}"
-    printf '"%s"' "$value"
-}
-
 [[ "$(uname -s)" == "Linux" ]] || die "this installer only supports Linux."
 command -v systemctl >/dev/null 2>&1 || die "systemctl is required."
 [[ -d /run/systemd/system ]] || die "systemd is not running as the system service manager."
@@ -44,7 +36,10 @@ python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' \
     || die "Python 3.11 or newer is required (found $(python3 --version 2>&1))."
 [[ -f "$project_dir/.env" ]] \
     || die "missing $project_dir/.env; copy .env.example and configure it first."
-[[ -x "$project_dir/service.sh" ]] || die "$project_dir/service.sh is not executable."
+[[ -f "$project_dir/service.sh" ]] || die "$project_dir/service.sh is missing."
+bash_path="$(command -v bash)"
+[[ "$project_dir" != *[[:space:]%]* && "$bash_path" != *[[:space:]%]* ]] \
+    || die "project and Bash paths must not contain whitespace or percent signs."
 
 if [[ ! -x "$project_dir/.venv/bin/python" ]]; then
     echo "Creating Python virtual environment..."
@@ -75,9 +70,6 @@ chmod 600 "$project_dir/.env" || die "could not restrict permissions on $project
 
 unit_file="$(mktemp)"
 trap 'rm -f "$unit_file"' EXIT
-quoted_project_dir="$(systemd_quote "$project_dir")"
-quoted_service_script="$(systemd_quote "$project_dir/service.sh")"
-
 {
     echo "# Managed by $project_dir/install.sh"
     echo "[Unit]"
@@ -89,8 +81,8 @@ quoted_service_script="$(systemd_quote "$project_dir/service.sh")"
     echo "Type=simple"
     echo "User=$install_user"
     echo "Group=$install_group"
-    echo "WorkingDirectory=$quoted_project_dir"
-    echo "ExecStart=$quoted_service_script"
+    echo "WorkingDirectory=$project_dir"
+    echo "ExecStart=$bash_path $project_dir/service.sh"
     echo "Restart=on-failure"
     echo "RestartSec=10s"
     echo "UMask=0077"
@@ -105,7 +97,11 @@ echo "Installing systemd service..."
 "${as_root[@]}" install -m 0644 "$unit_file" "$unit_path"
 "${as_root[@]}" systemctl daemon-reload
 "${as_root[@]}" systemctl enable "$service_name"
-"${as_root[@]}" systemctl restart "$service_name"
+if ! "${as_root[@]}" systemctl restart "$service_name"; then
+    "${as_root[@]}" systemctl --no-pager --full status "$service_name" >&2 || true
+    "${as_root[@]}" journalctl --no-pager -u "$service_name" -n 30 >&2 || true
+    die "service restart failed."
+fi
 
 sleep 2
 if ! "${as_root[@]}" systemctl is-active --quiet "$service_name"; then
