@@ -843,6 +843,33 @@ async def test_unattended_human_only_contract_finishes_provisional(
     assert "provisional" in matrix.room_send.await_args.kwargs["content"]["body"].lower()
 
 
+async def test_session_bound_yolo_does_not_pause_for_human_signoff(
+    tmp_path: Path,
+) -> None:
+    bot, matrix, _, store = make_bot(tmp_path)
+    human = PursuitCriterion(
+        "c1",
+        "The result meets the requested quality bar",
+        VerificationKind.HUMAN,
+    )
+    state = active_pursuit(tmp_path, criteria=[human], unattended=False)
+    state.yolo_permissions = True
+    state.yolo_session_id = state.session_id
+    assert state.pursuit_contract is not None
+    state.yolo_contract_digest = state.pursuit_contract.content_digest()
+    store.rooms["!one:example"] = state
+
+    await bot._run_pursuit_checks("!one:example", state)
+
+    assert state.pursuit_goal is None
+    assert state.pursuit_outcome is PursuitOutcome.PROVISIONAL
+    assert state.pursuit_history[-1].outcome is PursuitOutcome.PROVISIONAL
+    assert all(
+        "Reply `approve` to sign off" not in call.kwargs["content"]["body"]
+        for call in matrix.room_send.await_args_list
+    )
+
+
 @pytest.mark.parametrize("exhausted", ["cycles", "tool_calls", "input_tokens"])
 async def test_unattended_internal_budget_cap_auto_renews_without_checkpoint(
     tmp_path: Path, monkeypatch, exhausted: str

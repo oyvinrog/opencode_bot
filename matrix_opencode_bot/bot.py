@@ -672,6 +672,30 @@ class MatrixOpenCodeBot:
             and state.yolo_contract_digest == contract.content_digest()
         )
 
+    @classmethod
+    def _human_signoff_may_finish_unattended(cls, state: RoomSession) -> bool:
+        """Return whether YOLO covers the current contract's sign-off boundary."""
+
+        contract = state.pursuit_contract
+        if (
+            not state.yolo_permissions
+            or contract is None
+            or not contract.approval_is_current()
+        ):
+            return False
+        if (
+            cls._unattended_authorization_is_current(state)
+            and not cls._unattended_deadline_expired(state)
+        ):
+            return True
+        # YOLO may have been enabled later from a worker permission prompt. Its
+        # existing session/contract binding should also prevent an otherwise
+        # completed pursuit from stopping solely for human criteria.
+        return bool(
+            state.yolo_session_id == cls._active_session_id(state)
+            and state.yolo_contract_digest == contract.content_digest()
+        )
+
     def _cancel_session_permission_retries(
         self, room_id: str, state: RoomSession, session_id: str
     ) -> None:
@@ -2151,7 +2175,7 @@ Delegated task/subagent calls are disabled."""
             return
         if objective_passed and human:
             uncertainty = [f"[{item.id}] awaits human judgment" for item in human]
-            if state.pursuit_unattended:
+            if self._human_signoff_may_finish_unattended(state):
                 await self._finish_pursuit(
                     room_id, state, PursuitOutcome.PROVISIONAL, uncertainty
                 )
@@ -4511,7 +4535,7 @@ Delegated task/subagent calls are disabled."""
                 if state.pursuit_phase == "needs_input":
                     continue
                 if state.pursuit_phase == "awaiting_signoff":
-                    if state.pursuit_unattended:
+                    if self._human_signoff_may_finish_unattended(state):
                         contract = state.pursuit_contract
                         uncertainty = [
                             f"[{item.id}] awaits human judgment"

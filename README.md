@@ -215,8 +215,9 @@ separate LLM verifier and no free-form reflection loop. The pursuit reaches
 `verified_complete` only when every objective criterion passes against the latest
 result, and it may finish before its maximum duration.
 
-Without unattended YOLO, pursuits remain interactive. Unresolved human criteria
-pause at `awaiting_signoff`, missing facts or authorization pause at
+Without YOLO authorization bound to the current worker and contract, pursuits
+remain interactive. Unresolved human criteria pause at `awaiting_signoff`,
+missing facts or authorization pause at
 `needs_input`, and an exhausted cycle, tool-call, input-token, or wall-time tranche
 pauses at `budget_checkpoint`. The user can reply `continue`, revise and approve a
 new contract, sign off on the exact provisional result, or stop as appropriate.
@@ -230,6 +231,11 @@ material fact only the user can supply, an unavailable required verifier, or an
 explicit non-retryable permission refusal. If a blocker leads to a material
 contract revision, continuation requires approval of the new contract and a new
 lease.
+
+If YOLO is enabled later from a worker permission prompt, its session- and
+contract-bound authorization also prevents the completed run from pausing solely
+for human sign-off. It returns an explicitly provisional result instead; quota
+checkpoints remain interactive because no unattended deadline lease was granted.
 
 At the absolute deadline, worker actions stop and the controller performs one
 bounded, read-only final check. It then archives a terminal `verified_complete`

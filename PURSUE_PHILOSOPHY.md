@@ -176,6 +176,11 @@ refusal—may pause unattended work. Transient permission failures are retried.
 `!yolo off` revokes the lease, and `!stop` remains immediate. A material contract
 revision always requires new approval and starts a new deadline.
 
+YOLO enabled later for the current worker is still bound to that exact session
+and contract. It does not create an unattended deadline or renew quotas, but it
+does allow a completed run whose only remaining checks require judgment to return
+an explicitly provisional result instead of pausing for sign-off.
+
 Automatic rotations and progress messages may be reported to the room, but they
 are notices rather than prompts. A message that actually requires approval,
 input, or a permission decision says so explicitly. There is no promise to try
